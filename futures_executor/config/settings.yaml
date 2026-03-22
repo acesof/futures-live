@@ -1,0 +1,65 @@
+broker:
+  host: 127.0.0.1
+  port: 4002
+  client_id: 1
+  readonly: false
+  timeout: 30
+
+rfactory_path: /Users/acess/projects/R-factory
+
+instruments:
+  - symbol: MNQ
+    exchange: CME
+    portfolio_symbol: NQ
+  - symbol: MCL
+    exchange: NYMEX
+    portfolio_symbol: CL
+  - symbol: MES
+    exchange: CME
+    portfolio_symbol: ES
+  - symbol: MGC
+    exchange: COMEX
+    portfolio_symbol: GC
+  - symbol: ZN
+    exchange: CBOT
+
+roll:
+  days_before_expiry: 7
+  hard_deadline_days: 3
+  min_next_volume: 1000
+  merge_with_rebalance_window: 3
+
+execution:
+  portfolio_leverage: 1.0
+  abs_threshold: 1        # min contract delta to trade (noise filter)
+  rel_threshold: 0.15     # min % change vs current position to trade (15%)
+  gross_exposure_cap: 1.5 # max Σ|sized_j|; proportional scale-down if exceeded (null = no cap)
+  order_type: market
+
+vol_target:
+  enabled: true
+  target_vol: 0.10
+  vol_window: 60
+  max_leverage: 3.0
+  instrument_level: true  # V2: per-instrument vol targeting
+
+data:
+  lookback_bars: 200
+  continuous_dir: data/continuous
+  bar_history_dir: data/bars
+
+safety:
+  max_position_contracts: 10
+  max_total_contracts: 30
+  max_daily_turnover: 20
+  kill_switch_file: .kill_switch
+  heartbeat_timeout: 300
+
+audit:
+  db_path: data/audit.db
+
+signal:
+  account: "+37069693289"
+  recipient: "+37069693181"
+  enabled: true
+  cli_path: /opt/homebrew/bin/signal-cli
