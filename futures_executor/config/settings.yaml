@@ -44,7 +44,7 @@ vol_target:
   instrument_level: true  # V2: per-instrument vol targeting
 
 data:
-  lookback_bars: 200
+  lookback_bars: 500
   continuous_dir: data/continuous
   bar_history_dir: data/bars
 
