@@ -19,6 +19,8 @@ class InstrumentSettings(BaseModel):
     symbol: str           # execution symbol (e.g. MES, MNQ — what we trade)
     exchange: str
     portfolio_symbol: str = ""  # backtest symbol (e.g. ES, NQ — what strategies reference)
+    multiplier: float = 1.0    # dollar value per point per contract
+    margin: float = 0.0        # initial margin per contract (USD)
 
 
 class RollSettings(BaseModel):
@@ -33,6 +35,7 @@ class ExecutionSettings(BaseModel):
     abs_threshold: int = 1          # min contract delta to trade (noise filter)
     rel_threshold: float = 0.15     # min % change vs current position to trade
     gross_exposure_cap: float | None = None  # max Σ|sized_j|; None = no cap
+    margin_cap: float = 0.8        # max fraction of equity usable for margin
     order_type: str = "market"
 
 

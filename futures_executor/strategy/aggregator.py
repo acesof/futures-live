@@ -1,10 +1,14 @@
 """Multi-strategy signal aggregation with vol-targeting.
 
-V1: per-strategy vol scaling, then weighted sum (legacy).
+V1: per-strategy vol scaling, weighted per-instrument position reconstruction.
+    Output is sized_j — matching the R-factory portfolio pipeline exactly:
+    sized_j = Σ(w_i × scale_i × pos_i[last, j]) / n_instruments
+
 V2: raw signal aggregation with active-weight normalization,
     then instrument-level vol targeting. Output is sized_j —
     a fraction of capital already containing the risk budget B_j.
 
+Both modes return sized positions (fraction of capital).
 Imports core math from R-factory to maintain backtest-live parity.
 """
 
@@ -44,50 +48,31 @@ def _import_strategy(entry: StrategyEntry):
 
 
 # ---------------------------------------------------------------------------
-# V1: per-strategy vol scaling (legacy)
+# V1: per-strategy vol scaling, pipeline-matching position reconstruction
 # ---------------------------------------------------------------------------
-
-def _compute_vol_scale(
-    strategy_fn,
-    market_data,
-    params: dict,
-    vol_settings: VolTargetSettings,
-) -> float:
-    """Compute vol-targeting scale factor matching R-factory V1 backtest."""
-    from algo_research_factory.src.kernel.pnl import (
-        aggregate_returns,
-        compute_returns,
-    )
-    from algo_research_factory.src.kernel.positions import signals_to_positions
-    from algo_research_factory.src.portfolio.vol_target import rolling_volatility
-
-    output = strategy_fn(market_data, params)
-    positions = signals_to_positions(output.target_position)
-    returns_full = compute_returns(positions, market_data.close, cost_bps=0.0)
-    agg_returns = aggregate_returns(returns_full)
-
-    trailing_vol = rolling_volatility(agg_returns, window=vol_settings.vol_window)
-
-    if len(trailing_vol) < 2 or trailing_vol[-2] == 0 or np.isnan(trailing_vol[-2]):
-        return 1.0
-
-    last_vol = trailing_vol[-2]
-    scale = vol_settings.target_vol / last_vol
-    scale = min(scale, vol_settings.max_leverage)
-    return float(scale)
-
 
 def _aggregate_v1(
     market_data,
     strategies: list[StrategyEntry],
     config: ExecutorConfig,
 ) -> dict[str, float]:
-    """V1: per-strategy vol scaling → weighted sum. Raw signal output."""
+    """V1: replay strategies, vol-target scale, reconstruct per-instrument positions.
+
+    Matches R-factory pipeline.py exactly:
+      sized_pos[j] = Σ(w_i × vt_scale_i × pos_i[last, j]) / n_instruments
+
+    Returns sized positions (fraction of capital per instrument).
+    """
+    from algo_research_factory.src.kernel.pnl import aggregate_returns, compute_returns
     from algo_research_factory.src.kernel.positions import signals_to_positions
+    from algo_research_factory.src.portfolio.vol_target import vol_target_scale
 
     instrument_names = market_data.instrument_names
     n_instruments = len(instrument_names)
-    weighted_sum = np.zeros(n_instruments)
+    vt = config.vol_target
+
+    # Collect per-strategy: weight, last-bar scale, last-bar positions
+    strategy_data = []  # list of (weight, scale, positions_last)
 
     for entry in strategies:
         if not entry.enabled:
@@ -95,28 +80,58 @@ def _aggregate_v1(
         try:
             module = _import_strategy(entry)
             output = module.generate_signals(market_data, entry.params)
-            signals = np.clip(output.target_position[-1], -1.0, 1.0)
+            positions = signals_to_positions(output.target_position)
 
-            if config.vol_target.enabled:
-                vol_scale = _compute_vol_scale(
-                    module.generate_signals, market_data,
-                    entry.params, config.vol_target,
+            # Compute vol-target scale from aggregated 1D returns
+            returns_2d = compute_returns(positions, market_data.close, cost_bps=0.0)
+            returns_1d = aggregate_returns(returns_2d)
+
+            if vt.enabled:
+                scale_series = vol_target_scale(
+                    returns_1d,
+                    target_vol=vt.target_vol,
+                    vol_window=vt.vol_window,
+                    max_leverage=vt.max_leverage,
                 )
+                last_scale = float(scale_series[-1])
             else:
-                vol_scale = 1.0
+                last_scale = 1.0
 
-            weighted_sum += signals * vol_scale * entry.weight
+            # Last-bar positions per instrument
+            if positions.ndim == 2:
+                pos_last = positions[-1]  # (n_instruments,)
+            else:
+                pos_last = np.array([positions[-1]])
+
+            strategy_data.append((entry.weight, last_scale, pos_last))
             logger.debug(
-                f"  {entry.name}: vol_scale={vol_scale:.3f} "
-                f"weight={entry.weight:.4f} signals={signals}"
+                f"  {entry.name}: vt_scale={last_scale:.3f} "
+                f"weight={entry.weight:.4f} pos_last={pos_last}"
             )
         except Exception as e:
             logger.error(f"Strategy {entry.name} failed: {e}")
             continue
 
+    if not strategy_data:
+        logger.warning("No strategies produced signals")
+        return {name: 0.0 for name in instrument_names}
+
+    # Reconstruct per-instrument sized positions
+    # sized_pos[j] = Σ(w_i × scale_i × pos_i[j]) / n_instruments
+    sized = np.zeros(n_instruments)
+    for j in range(n_instruments):
+        for weight, scale, pos_last in strategy_data:
+            sized[j] += weight * scale * pos_last[j]
+        sized[j] /= n_instruments
+
     targets = {}
     for i, name in enumerate(instrument_names):
-        targets[name] = float(weighted_sum[i])
+        targets[name] = float(sized[i])
+
+    logger.info(
+        f"V1 targets ({len(strategy_data)} strategies): "
+        + ", ".join(f"{k}={v:+.6f}" for k, v in targets.items())
+    )
     return targets
 
 
@@ -243,9 +258,10 @@ def compute_aggregate_targets(
     """Compute per-instrument target positions.
 
     Returns (targets_dict, is_v2) where:
-      - V1 targets: raw weighted signal in [-1, 1], needs /n_instruments in sizing
-      - V2 targets: sized exposure fraction, already includes risk budget B_j
-      - is_v2: True if V2 was used (so caller knows sizing convention)
+      - Both V1 and V2 targets are sized exposure fractions.
+      - V1: reconstructed from per-strategy vol-scaled positions / n_instruments
+      - V2: instrument-level vol targeting with risk budget B_j embedded
+      - is_v2: True if V2 was used
     """
     is_v2 = config.vol_target.instrument_level
 
@@ -256,7 +272,7 @@ def compute_aggregate_targets(
 
     # Apply gross exposure cap (proportional scale-down)
     cap = config.execution.gross_exposure_cap
-    if cap is not None and is_v2:
+    if cap is not None:
         targets = _apply_gross_cap(targets, cap)
 
     logger.info(

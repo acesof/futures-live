@@ -1,14 +1,20 @@
-"""Position diff, contract sizing, roll execution, and rebalance logic."""
+"""Position diff, contract sizing, margin cap, roll execution, and rebalance logic.
+
+Sizing matches R-factory execution_sim.py:
+  target_contracts = round(sized_pos × equity × leverage / (price × multiplier))
+
+Both V1 and V2 produce sized positions, so sizing is unified.
+"""
 
 import logging
-import math
 from dataclasses import dataclass
+
+import numpy as np
 
 from futures_executor.config.loader import (
     ExecutionSettings,
     ExecutorConfig,
     InstrumentSettings,
-    RollSettings,
     SafetySettings,
 )
 from futures_executor.data.contract_resolver import ContractPair
@@ -33,7 +39,7 @@ class PositionDelta:
 class SizingResult:
     """Contract sizing output for one instrument."""
     symbol: str
-    target_signal: float       # from aggregator, in [-1, 1]
+    target_signal: float       # sized position (fraction of capital)
     target_contracts: int      # signed
     notional_per_contract: float
     multiplier: float
@@ -45,19 +51,14 @@ def compute_contract_size(
     equity: float,
     last_price: float,
     multiplier: float,
-    n_instruments: int,
     config: ExecutionSettings,
-    is_v2: bool = False,
 ) -> SizingResult:
-    """Convert a target signal to a number of contracts.
+    """Convert a sized position to a number of contracts.
 
-    V1 formula (signal is raw [-1,1], executor applies risk budget):
-        n = floor(signal × equity × portfolio_leverage
-                  / (n_instruments × notional_per_contract))
+    Unified formula (both V1 and V2 produce sized positions):
+        n = round(sized_pos × equity × portfolio_leverage / notional_per_contract)
 
-    V2 formula (signal is sized_j, risk budget B_j already included):
-        n = floor(sized_j × equity × portfolio_leverage
-                  / notional_per_contract)
+    Matches R-factory execution_sim.py contract conversion.
     """
     notional_per_contract = last_price * multiplier
 
@@ -68,16 +69,9 @@ def compute_contract_size(
             multiplier=multiplier, last_price=last_price,
         )
 
-    if is_v2:
-        # V2: signal already contains risk budget — no n_instruments division
-        raw = (signal * equity * config.portfolio_leverage
-               / notional_per_contract)
-    else:
-        # V1: executor applies equal risk budget via n_instruments
-        raw = (signal * equity * config.portfolio_leverage
-               / (n_instruments * notional_per_contract))
+    raw = (signal * equity * config.portfolio_leverage
+           / notional_per_contract)
 
-    # Round to nearest integer (gross cap handles aggregate overshoot)
     target = round(raw)
 
     return SizingResult(
@@ -88,6 +82,42 @@ def compute_contract_size(
         multiplier=multiplier,
         last_price=last_price,
     )
+
+
+def apply_margin_cap(
+    sizing: dict[str, SizingResult],
+    instruments: list[InstrumentSettings],
+    available_margin: float,
+) -> dict[str, SizingResult]:
+    """Scale down contracts proportionally if total margin exceeds budget.
+
+    Matches R-factory execution_sim.py _apply_margin_cap().
+    """
+    margin_map = {i.symbol: i.margin for i in instruments}
+    # Also map portfolio symbols
+    for i in instruments:
+        if i.portfolio_symbol:
+            margin_map[i.portfolio_symbol] = i.margin
+
+    total_required = 0.0
+    for sym, sz in sizing.items():
+        margin_per = margin_map.get(sym, 0.0)
+        total_required += abs(sz.target_contracts) * margin_per
+
+    if total_required <= available_margin or total_required < 1e-10:
+        return sizing
+
+    scale = available_margin / total_required
+    logger.warning(
+        f"Margin cap: required ${total_required:,.0f} > "
+        f"available ${available_margin:,.0f}, scaling by {scale:.3f}"
+    )
+
+    for sym, sz in sizing.items():
+        scaled = sz.target_contracts * scale
+        sz.target_contracts = int(np.fix(scaled))
+
+    return sizing
 
 
 def compute_position_diff(
@@ -199,23 +229,18 @@ class OrderManager:
         target_signals: dict[str, float],
         contract_pairs: dict[str, ContractPair],
         equity: float,
-        is_v2: bool = False,
     ) -> list[dict]:
         """Execute full rebalance cycle.
 
-        1. Size targets (signal → contracts)
-        2. Compute diffs vs current positions
-        3. Handle rolls (calendar spreads) where needed
-        4. Execute remaining position adjustments
-        5. Return list of execution records
-
-        Args:
-            is_v2: If True, signals are already risk-budgeted (V2 sized positions).
-                   Contract sizing will NOT divide by n_instruments.
+        1. Size targets (sized_pos → contracts) — unified for V1/V2
+        2. Apply margin cap
+        3. Compute diffs vs current positions
+        4. Handle rolls (calendar spreads) where needed
+        5. Execute remaining position adjustments
+        6. Return list of execution records
 
         Returns list of dicts with execution details for audit logging.
         """
-        n_instruments = len(target_signals)
         current_positions = self.broker.get_positions_by_symbol()
         records = []
 
@@ -237,20 +262,24 @@ class OrderManager:
                 equity=equity,
                 last_price=last_price,
                 multiplier=pair.front.multiplier,
-                n_instruments=n_instruments,
                 config=self.config.execution,
-                is_v2=is_v2,
             )
             result.symbol = symbol
             sizing[symbol] = result
 
             logger.info(
-                f"{symbol}: signal={signal:+.4f} → "
+                f"{symbol}: sized_pos={signal:+.6f} → "
                 f"target={result.target_contracts} contracts "
                 f"(notional/ct=${result.notional_per_contract:,.0f})"
             )
 
-        # Step 2: Compute position diffs
+        # Step 2: Margin cap
+        available_margin = equity * self.config.execution.margin_cap
+        sizing = apply_margin_cap(
+            sizing, self.config.instruments, available_margin,
+        )
+
+        # Step 3: Compute position diffs
         deltas: dict[str, PositionDelta] = {}
         for symbol, sz in sizing.items():
             current = current_positions.get(symbol)
@@ -267,12 +296,12 @@ class OrderManager:
             )
             deltas[symbol] = delta
 
-        # Step 3: Enforce safety limits
+        # Step 4: Enforce safety limits
         deltas = enforce_safety_limits(
             deltas, current_positions, self.config.safety,
         )
 
-        # Step 4: Execute — rolls first, then adjustments
+        # Step 5: Execute — rolls first, then adjustments
         for symbol, delta in deltas.items():
             pair = contract_pairs[symbol]
 
@@ -520,4 +549,3 @@ class OrderManager:
             logger.warning(f"{pair.symbol}: failed to get last price: {e}")
 
         return 0.0
-

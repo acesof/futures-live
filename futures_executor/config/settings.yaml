@@ -11,17 +11,27 @@ instruments:
   - symbol: MNQ
     exchange: CME
     portfolio_symbol: NQ
+    multiplier: 2.0        # $2 per point (Micro NQ)
+    margin: 2100
   - symbol: MCL
     exchange: NYMEX
     portfolio_symbol: CL
+    multiplier: 100.0      # $100 per point (Micro CL)
+    margin: 1000
   - symbol: MES
     exchange: CME
     portfolio_symbol: ES
+    multiplier: 5.0        # $5 per point (Micro ES)
+    margin: 1500
   - symbol: MGC
     exchange: COMEX
     portfolio_symbol: GC
+    multiplier: 10.0       # $10 per point (Micro GC)
+    margin: 800
   - symbol: ZN
     exchange: CBOT
+    multiplier: 1000.0     # $1000 per point (10-Year Note)
+    margin: 2000
 
 roll:
   days_before_expiry: 7
@@ -33,14 +43,15 @@ execution:
   portfolio_leverage: 1.0
   abs_threshold: 1        # min contract delta to trade (noise filter)
   rel_threshold: 0.15     # min % change vs current position to trade (15%)
-  gross_exposure_cap: 1.5 # max Σ|sized_j|; proportional scale-down if exceeded (null = no cap)
+  gross_exposure_cap: 5.0 # max Σ|sized_j|; proportional scale-down if exceeded (null = no cap)
+  margin_cap: 0.8        # max fraction of equity usable for initial margin
   order_type: market
 
 vol_target:
   enabled: true
-  target_vol: 0.10
+  target_vol: 0.20
   vol_window: 60
-  max_leverage: 3.0
+  max_leverage: 10.0
   instrument_level: true  # V2: per-instrument vol targeting
 
 data:
