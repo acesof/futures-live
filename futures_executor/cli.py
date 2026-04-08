@@ -117,9 +117,16 @@ def cmd_run_once(args):
         continuous = ContinuousSeries(Path(config.data.continuous_dir))
 
         for symbol, pair in contract_pairs.items():
+            lookback = config.data.lookback_bars
+            if lookback > 365:
+                # IBKR rejects day durations > 365; convert to years
+                years = (lookback // 365) + 1
+                duration_str = f"{years} Y"
+            else:
+                duration_str = f"{lookback} D"
             front_bars = bar_fetcher.fetch_and_cache(
                 pair.front.contract, symbol,
-                duration=f"{config.data.lookback_bars} D",
+                duration=duration_str,
             )
             next_bars = None
             if pair.next:

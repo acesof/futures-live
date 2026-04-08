@@ -40,7 +40,7 @@ roll:
   merge_with_rebalance_window: 3
 
 execution:
-  portfolio_leverage: 1.0
+  portfolio_leverage: 10.0
   abs_threshold: 1        # min contract delta to trade (noise filter)
   rel_threshold: 0.15     # min % change vs current position to trade (15%)
   gross_exposure_cap: 5.0 # max Σ|sized_j|; proportional scale-down if exceeded (null = no cap)
@@ -49,10 +49,10 @@ execution:
 
 vol_target:
   enabled: true
-  target_vol: 0.20
+  target_vol: 0.30
   vol_window: 60
   max_leverage: 10.0
-  instrument_level: true  # V2: per-instrument vol targeting
+  instrument_level: false  # V1: per-strategy vol targeting
 
 data:
   lookback_bars: 500

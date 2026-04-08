@@ -1,0 +1,156 @@
+strategies:
+- name: atr_range_ratio_trend_filter_ema
+  module_path: /Users/acess/projects/R-factory/strategies/generated/atr_range_ratio_trend_filter_ema.py
+  params:
+    atr_period: 16
+    range_ratio_threshold: 0.78
+    ema_period: 26
+    risk_fraction: 0.007
+    _max_train_bar: 4500
+  weight: 0.7969
+  enabled: true
+- name: carry_volatility_adjusted_position_sizing
+  module_path: /Users/acess/projects/R-factory/strategies/generated/carry_volatility_adjusted_position_sizing.py
+  params:
+    atr_period: 7
+    atr_ma_period: 30
+    volatility_spike_threshold: 0.735
+    base_position_size: 0.01955
+    _max_train_bar: 4500
+  weight: 0.1069
+  enabled: true
+- name: triple_ema_slope_alignment
+  module_path: /Users/acess/projects/R-factory/strategies/generated/triple_ema_slope_alignment.py
+  params:
+    ema_short_period: 3
+    ema_medium_period: 14
+    ema_long_period: 26
+    slope_period: 2
+    _max_train_bar: 4500
+  weight: 0.042
+  enabled: true
+- name: weekly_high_breakout_vol_divergence
+  module_path: /Users/acess/projects/R-factory/strategies/generated/weekly_high_breakout_vol_divergence.py
+  params:
+    weekly_lookback: 1
+    volume_avg_period: 14
+    atr_period: 12
+    atr_multiplier: 2.34
+    _max_train_bar: 4500
+  weight: 0.0092
+  enabled: true
+- name: triple_ema_ribbon_trend_macd_confirmation
+  module_path: /Users/acess/projects/R-factory/strategies/generated/triple_ema_ribbon_trend_macd_confirmation.py
+  params:
+    ema_fast_len: 4
+    ema_medium_len: 14
+    ema_slow_len: 29
+    macd_fast_len: 13
+    macd_slow_len: 23
+    macd_signal_len: 9
+    _max_train_bar: 4500
+  weight: 0.0054
+  enabled: true
+- name: momentum_rotation_volatility_adjusted
+  module_path: /Users/acess/projects/R-factory/strategies/generated/momentum_rotation_volatility_adjusted.py
+  params:
+    roc_period: 17
+    atr_period: 21
+    volatility_cap: 1.4
+    roc_exit_threshold: 0.0
+    num_instruments: 1
+    use_volatility_sizing: false
+    _max_train_bar: 4500
+  weight: 0.0049
+  enabled: true
+- name: volatility_adjusted_carry_momentum
+  module_path: /Users/acess/projects/R-factory/strategies/generated/volatility_adjusted_carry_momentum.py
+  params:
+    return_lookback: 15
+    atr_short: 12
+    atr_long_sma: 75
+    rank_threshold: 1
+    stop_atr_multiple: 0.735
+    _max_train_bar: 4500
+  weight: 0.0045
+  enabled: true
+- name: ema_channel_breakout_pullback
+  module_path: /Users/acess/projects/R-factory/strategies/generated/ema_channel_breakout_pullback.py
+  params:
+    fast_ema: 11
+    slow_ema: 32
+    channel_lookback: 10
+    pullback_threshold_pct: 0.6545
+    _max_train_bar: 4500
+  weight: 0.0044
+  enabled: true
+- name: adx_trend_volume_confirm
+  module_path: /Users/acess/projects/R-factory/strategies/generated/adx_trend_volume_confirm.py
+  params:
+    adx_period: 10
+    volume_ma_period: 11
+    adx_entry_threshold: 18
+    adx_exit_threshold: 20
+    trend_ma_period: 64
+    _max_train_bar: 4500
+  weight: 0.0044
+  enabled: true
+- name: low_vol_trend_incubation
+  module_path: /Users/acess/projects/R-factory/strategies/generated/low_vol_trend_incubation.py
+  params:
+    trend_ma_length: 31
+    realized_vol_length: 8
+    vol_ma_length: 20
+    entry_vol_ratio_max: 0.6
+    exit_vol_ratio_min: 1.48
+    size_volatility_scalar: 0.35
+    _max_train_bar: 4500
+  weight: 0.0043
+  enabled: true
+- name: dual_ema_trend_alignment
+  module_path: /Users/acess/projects/R-factory/strategies/generated/dual_ema_trend_alignment.py
+  params:
+    daily_ema_period: 13
+    weekly_ema_period: 48
+    atr_period: 7
+    atr_multiplier: 0.7
+    _max_train_bar: 4500
+  weight: 0.0043
+  enabled: true
+- name: calendar_proxy_carry_trend_filter
+  module_path: /Users/acess/projects/R-factory/strategies/generated/calendar_proxy_carry_trend_filter.py
+  params:
+    trend_sma: 32
+    seasonal_window_start_day: 1
+    seasonal_window_length_days: 30
+    trend_buffer_pct: 0.391
+    atr_stop_mult: 2.03665
+    max_hold_days: 9
+    _max_train_bar: 4500
+  weight: 0.0043
+  enabled: true
+- name: volume_quiet_accumulation_trend_resume
+  module_path: /Users/acess/projects/R-factory/strategies/generated/volume_quiet_accumulation_trend_resume.py
+  params:
+    trend_sma_length: 39
+    roc_length: 9
+    volume_ma_length: 32
+    volume_ratio_max: 0.588
+    pullback_lookback: 2
+    holding_days: 2
+    _max_train_bar: 4500
+  weight: 0.0042
+  enabled: true
+- name: volatility_filter_bb_width_expansion_signal
+  module_path: /Users/acess/projects/R-factory/strategies/generated/volatility_filter_bb_width_expansion_signal.py
+  params:
+    bb_period: 23
+    bb_std: 0.98
+    width_expansion_pct: 10
+    width_ma_period: 4
+    _max_train_bar: 4500
+  weight: 0.0042
+  enabled: true
+aggregation:
+  consensus_threshold: 0.3
+  method: weighted_average
