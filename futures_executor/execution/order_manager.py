@@ -304,6 +304,16 @@ class OrderManager:
         # Step 5: Execute — rolls first, then adjustments
         for symbol, delta in deltas.items():
             pair = contract_pairs[symbol]
+            sz = sizing.get(symbol)
+
+            # Enrich every record with sizing context for audit/slippage
+            def _enrich(rec: dict) -> dict:
+                if sz:
+                    rec["bar_close"] = sz.last_price
+                    rec["target_contracts"] = sz.target_contracts
+                    rec["target_signal"] = sz.target_signal
+                rec["current_contracts"] = delta.current_contracts
+                return rec
 
             # Handle rolls via calendar spread
             if delta.needs_roll and pair.next is not None:
@@ -313,7 +323,7 @@ class OrderManager:
                         symbol, pair, int(current.position),
                     )
                     if roll_record:
-                        records.append(roll_record)
+                        records.append(_enrich(roll_record))
 
             # Handle position adjustments
             if delta.action == "HOLD":
@@ -323,11 +333,12 @@ class OrderManager:
             if delta.is_reversal:
                 # Close first, then open in new direction
                 rev_records = self._execute_reversal(symbol, pair, delta)
-                records.extend(rev_records)
+                for rec in rev_records:
+                    records.append(_enrich(rec))
             else:
                 record = self._execute_adjustment(symbol, pair, delta)
                 if record:
-                    records.append(record)
+                    records.append(_enrich(record))
 
         return records
 

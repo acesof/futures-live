@@ -8,11 +8,6 @@ broker:
 rfactory_path: /Users/acess/projects/R-factory
 
 instruments:
-  - symbol: MNQ
-    exchange: CME
-    portfolio_symbol: NQ
-    multiplier: 2.0        # $2 per point (Micro NQ)
-    margin: 2100
   - symbol: MCL
     exchange: NYMEX
     portfolio_symbol: CL
@@ -28,10 +23,6 @@ instruments:
     portfolio_symbol: GC
     multiplier: 10.0       # $10 per point (Micro GC)
     margin: 800
-  - symbol: ZN
-    exchange: CBOT
-    multiplier: 1000.0     # $1000 per point (10-Year Note)
-    margin: 2000
 
 roll:
   days_before_expiry: 7

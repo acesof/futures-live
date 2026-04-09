@@ -214,7 +214,11 @@ def cmd_run_once(args):
                 event_type=event_type,
                 action=rec.get("action"),
                 quantity=rec.get("quantity"),
+                target_contracts=rec.get("target_contracts"),
+                current_contracts=rec.get("current_contracts"),
+                target_signal=rec.get("target_signal"),
                 fill_price=rec.get("fill_price"),
+                bar_close=rec.get("bar_close"),
                 commission=commission,
                 status=status,
                 error=rec.get("error"),
@@ -238,12 +242,15 @@ def cmd_run_once(args):
             last_rebalance_date=state.get("last_run_date"),
         )
 
-        notifier.notify_run_summary(
+        summary = notifier.build_run_summary(
             run_date=today, equity=account.equity,
+            targets=targets, records=records,
             n_orders=n_orders, n_rolls=n_rolls, n_errors=n_errors,
             total_commission=total_commission,
             positions=pos_map,
         )
+        print(summary)
+        notifier.send(summary)
 
         logger.info(
             f"Run complete: {n_orders} orders, {n_rolls} rolls, "
