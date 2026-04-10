@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Daily execution wrapper — called by cron
-# Scheduled at both 23:05 and 00:05 local to cover DST.
-# Only the invocation at 21:xx UTC actually runs; the other exits silently.
+# Runs at NY close (5pm ET). Scheduled at 23:10 and 00:10 local
+# to cover DST (spring gap needs 23:xx) — only the one landing on 5pm ET runs.
 set -euo pipefail
 
-# UTC guard: only run if current UTC hour is 21
-UTC_HOUR=$(date -u +%H)
-if [ "$UTC_HOUR" != "21" ]; then
+# Only run if it's currently 5pm (17:xx) US Eastern
+ET_HOUR=$(TZ='America/New_York' date +%H)
+if [ "$ET_HOUR" != "17" ]; then
     exit 0
 fi
 
