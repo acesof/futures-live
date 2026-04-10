@@ -185,19 +185,17 @@ class AuditLog:
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
-    def get_slippage_stats(self, n_days: int = 30) -> dict:
-        """Compute slippage statistics over recent executions."""
+    def get_slippage_report(self, n: int = 100) -> list[dict]:
+        """Per-fill slippage detail (matches FXE format)."""
         cursor = self._conn.execute(
-            """SELECT symbol,
-                      COUNT(*) as n_fills,
-                      AVG(slippage_ticks) as avg_slippage,
-                      MAX(ABS(slippage_ticks)) as max_slippage,
-                      SUM(commission) as total_commission
+            """SELECT timestamp, symbol, action, bar_close, fill_price,
+                      slippage_ticks, commission
                FROM executions
-               WHERE slippage_ticks IS NOT NULL
-                 AND status != 'FAILED'
-               GROUP BY symbol
-               ORDER BY symbol""",
+               WHERE status != 'FAILED'
+                 AND fill_price IS NOT NULL
+                 AND action IN ('BUY', 'SELL')
+               ORDER BY id DESC LIMIT ?""",
+            (n,),
         )
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]

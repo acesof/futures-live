@@ -444,31 +444,56 @@ def cmd_audit(args):
 
     audit = AuditLog(config.audit.db_path)
 
-    if args.slippage:
-        stats = audit.get_slippage_stats(n_days=args.days)
-        print(f"\nSlippage Stats (last {args.days} days):")
-        print(f"{'Symbol':8s} {'Fills':>6s} {'Avg Slip':>10s} {'Max Slip':>10s} {'Commission':>12s}")
-        print("-" * 50)
-        for s in stats:
-            print(
-                f"{s['symbol']:8s} {s['n_fills']:6d} "
-                f"{s['avg_slippage']:10.4f} {s['max_slippage']:10.4f} "
-                f"${s['total_commission']:11.2f}"
-            )
-    else:
-        runs = audit.get_run_history(n=args.days)
-        print(f"\nRun History (last {args.days} runs):")
-        print(f"{'Date':12s} {'Equity':>14s} {'Orders':>7s} {'Rolls':>6s} "
-              f"{'Errors':>7s} {'Commission':>12s}")
-        print("-" * 65)
-        for r in runs:
-            print(
-                f"{r['run_date']:12s} ${r['equity']:13,.2f} "
-                f"{r['n_orders']:7d} {r['n_rolls']:6d} "
-                f"{r['n_errors']:7d} ${r['total_commission']:11.2f}"
-            )
+    runs = audit.get_run_history(n=args.days)
+    print(f"\nRun History (last {args.days} runs):")
+    print(f"{'Date':12s} {'Equity':>14s} {'Orders':>7s} {'Rolls':>6s} "
+          f"{'Errors':>7s} {'Commission':>12s}")
+    print("-" * 65)
+    for r in runs:
+        print(
+            f"{r['run_date']:12s} ${r['equity']:13,.2f} "
+            f"{r['n_orders']:7d} {r['n_rolls']:6d} "
+            f"{r['n_errors']:7d} ${r['total_commission']:11.2f}"
+        )
 
     audit.close()
+    return 0
+
+
+def cmd_slippage(args):
+    """Show per-fill slippage detail (FXE-style)."""
+    config = load_settings(CONFIG_DIR)
+
+    from futures_executor.monitoring.audit import AuditLog
+
+    audit = AuditLog(config.audit.db_path)
+    rows = audit.get_slippage_report(args.limit)
+    audit.close()
+
+    if not rows:
+        print("No filled orders with slippage data yet.")
+        return 0
+
+    print(
+        f"{'Timestamp':<22} {'Symbol':<8} {'Side':<5} "
+        f"{'BarClose':>12} {'Fill':>12} {'Slippage':>12}"
+    )
+    print("-" * 75)
+    for r in rows:
+        bar = r["bar_close"] or 0
+        fill = r["fill_price"] or 0
+        slip = r["slippage_ticks"] or 0
+        print(
+            f"{r['timestamp'][:19]:<22} {r['symbol']:<8} {r['action']:<5} "
+            f"{bar:>12.4f} {fill:>12.4f} {slip:>+12.4f}"
+        )
+
+    # Summary
+    slips = [r["slippage_ticks"] for r in rows if r["slippage_ticks"] is not None]
+    if slips:
+        print(f"\nSummary ({len(slips)} fills):")
+        print(f"  Slippage: mean={sum(slips)/len(slips):+.4f}  max={max(slips, key=abs):+.4f}")
+
     return 0
 
 
@@ -649,9 +674,12 @@ def main():
     # audit
     p_audit = sub.add_parser("audit", help="Show execution history")
     p_audit.add_argument("--days", type=int, default=30, help="Number of records")
-    p_audit.add_argument("--slippage", action="store_true",
-                         help="Show slippage stats instead of run history")
     p_audit.set_defaults(func=cmd_audit)
+
+    # slippage
+    p_slip = sub.add_parser("slippage", help="Show per-fill slippage detail")
+    p_slip.add_argument("-n", "--limit", type=int, default=100, help="Number of fills")
+    p_slip.set_defaults(func=cmd_slippage)
 
     args = parser.parse_args()
     _setup_logging(args.verbose)
