@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Daily execution wrapper — called by cron
-# Runs at NY close (5pm ET). Scheduled at 23:10 and 00:10 local
-# to cover DST (spring gap needs 23:xx) — only the one landing on 5pm ET runs.
+# Runs at 4:55pm ET (before CME 5pm maintenance break).
+# Builds today's bar from 5-min intraday, executes while market is live.
+# Scheduled at 22:55 and 23:55 local to cover DST spring gap.
 set -euo pipefail
 
-# Only run if it's currently 5pm (17:xx) US Eastern
+# Only run if it's currently 4pm hour (16:xx) US Eastern
 ET_HOUR=$(TZ='America/New_York' date +%H)
-if [ "$ET_HOUR" != "17" ]; then
+if [ "$ET_HOUR" != "16" ]; then
     exit 0
 fi
 

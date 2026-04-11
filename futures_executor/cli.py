@@ -128,6 +128,13 @@ def cmd_run_once(args):
                 pair.front.contract, symbol,
                 duration=duration_str,
             )
+
+            # Build today's bar from 5-min intraday (not yet in daily history)
+            today_bar = bar_fetcher.fetch_todays_bar(pair.front.contract)
+            if not today_bar.empty:
+                import pandas as pd
+                front_bars = pd.concat([front_bars, today_bar], ignore_index=True)
+
             next_bars = None
             if pair.next:
                 next_bars = bar_fetcher.fetch_bars(
