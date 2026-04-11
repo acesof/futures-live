@@ -325,6 +325,7 @@ class OrderManager:
                 return rec
 
             # Handle rolls via calendar spread
+            rolled = False
             if delta.needs_roll and pair.next is not None:
                 current = current_positions.get(symbol)
                 if current and current.position != 0:
@@ -343,6 +344,18 @@ class OrderManager:
                             f"skipping adjustment"
                         )
                         continue
+                    rolled = True
+
+            # After successful roll, adjustments must target the new contract
+            if rolled:
+                pair = ContractPair(
+                    symbol=pair.symbol,
+                    front=pair.next,
+                    next=None,
+                    roll_due=False,
+                    hard_deadline=False,
+                    days_to_expiry=pair.days_to_expiry,
+                )
 
             # Handle position adjustments
             if delta.action == "HOLD":
