@@ -230,14 +230,14 @@ class OrderManager:
         contract_pairs: dict[str, ContractPair],
         equity: float,
     ) -> list[dict]:
-        """Execute full rebalance cycle.
+        """Execute full rebalance cycle with verification and reconciliation.
 
         1. Size targets (sized_pos → contracts) — unified for V1/V2
         2. Apply margin cap
         3. Compute diffs vs current positions
-        4. Handle rolls (calendar spreads) where needed
-        5. Execute remaining position adjustments
-        6. Return list of execution records
+        4. Execute orders (rolls first, then adjustments)
+        5. Cancel any unfilled orders
+        6. Reconcile: re-read positions, place corrective orders if needed
 
         Returns list of dicts with execution details for audit logging.
         """
@@ -279,6 +279,11 @@ class OrderManager:
             sizing, self.config.instruments, available_margin,
         )
 
+        # Build target_contracts map for reconciliation
+        target_contracts: dict[str, int] = {
+            sym: sz.target_contracts for sym, sz in sizing.items()
+        }
+
         # Step 3: Compute position diffs
         deltas: dict[str, PositionDelta] = {}
         for symbol, sz in sizing.items():
@@ -300,30 +305,44 @@ class OrderManager:
         deltas = enforce_safety_limits(
             deltas, current_positions, self.config.safety,
         )
+        # Update targets after safety clamping
+        for sym, d in deltas.items():
+            target_contracts[sym] = d.target_contracts
 
         # Step 5: Execute — rolls first, then adjustments
+        pending_trades: list[tuple[str, "Trade"]] = []
+
         for symbol, delta in deltas.items():
             pair = contract_pairs[symbol]
             sz = sizing.get(symbol)
 
-            # Enrich every record with sizing context for audit/slippage
-            def _enrich(rec: dict) -> dict:
-                if sz:
-                    rec["bar_close"] = sz.last_price
-                    rec["target_contracts"] = sz.target_contracts
-                    rec["target_signal"] = sz.target_signal
-                rec["current_contracts"] = delta.current_contracts
+            def _enrich(rec: dict, _sz=sz, _delta=delta) -> dict:
+                if _sz:
+                    rec["bar_close"] = _sz.last_price
+                    rec["target_contracts"] = _sz.target_contracts
+                    rec["target_signal"] = _sz.target_signal
+                rec["current_contracts"] = _delta.current_contracts
                 return rec
 
             # Handle rolls via calendar spread
             if delta.needs_roll and pair.next is not None:
                 current = current_positions.get(symbol)
                 if current and current.position != 0:
-                    roll_record = self._execute_roll(
+                    roll_record, roll_trade = self._execute_roll(
                         symbol, pair, int(current.position),
                     )
                     if roll_record:
                         records.append(_enrich(roll_record))
+                    if roll_trade and not roll_trade.isDone():
+                        pending_trades.append((symbol, roll_trade))
+                    # If roll didn't fill, skip adjustment for this symbol
+                    if roll_trade and roll_trade.orderStatus.status != "Filled":
+                        logger.warning(
+                            f"{symbol}: roll not filled "
+                            f"(status={roll_trade.orderStatus.status}), "
+                            f"skipping adjustment"
+                        )
+                        continue
 
             # Handle position adjustments
             if delta.action == "HOLD":
@@ -331,14 +350,152 @@ class OrderManager:
                 continue
 
             if delta.is_reversal:
-                # Close first, then open in new direction
                 rev_records = self._execute_reversal(symbol, pair, delta)
                 for rec in rev_records:
                     records.append(_enrich(rec))
             else:
-                record = self._execute_adjustment(symbol, pair, delta)
+                record, trade = self._execute_adjustment(symbol, pair, delta)
                 if record:
                     records.append(_enrich(record))
+                if trade and not trade.isDone():
+                    pending_trades.append((symbol, trade))
+
+        # Step 6: Cancel unfilled orders
+        for symbol, trade in pending_trades:
+            if not trade.isDone():
+                logger.warning(
+                    f"{symbol}: order {trade.order.orderId} not filled "
+                    f"(status={trade.orderStatus.status}), cancelling"
+                )
+                self.broker.cancel_order(trade)
+
+        # Step 7: Reconcile — re-read positions vs targets
+        reconcile_records = self._reconcile(
+            target_contracts, contract_pairs, sizing,
+        )
+        records.extend(reconcile_records)
+
+        return records
+
+    def _reconcile(
+        self,
+        target_contracts: dict[str, int],
+        contract_pairs: dict[str, ContractPair],
+        sizing: dict[str, SizingResult],
+    ) -> list[dict]:
+        """Re-read positions, place corrective orders for any mismatches."""
+        records = []
+
+        # Reconnect if needed
+        if not self.broker.is_connected:
+            if not self.broker.reconnect():
+                logger.error("Cannot reconcile — reconnect failed")
+                return [{
+                    "type": "reconcile_error",
+                    "symbol": "",
+                    "error": "Reconnect failed, positions unverified",
+                    "status": "FAILED",
+                }]
+
+        actual_positions = self.broker.get_positions_by_symbol()
+
+        mismatches = []
+        for symbol, target in target_contracts.items():
+            actual = actual_positions.get(symbol)
+            actual_qty = int(actual.position) if actual else 0
+            if actual_qty != target:
+                mismatches.append((symbol, actual_qty, target))
+
+        if not mismatches:
+            logger.info("Reconciliation: all positions match targets")
+            return records
+
+        # Place corrective orders
+        for symbol, actual_qty, target in mismatches:
+            delta = target - actual_qty
+            if delta == 0:
+                continue
+
+            action = "BUY" if delta > 0 else "SELL"
+            qty = abs(delta)
+            pair = contract_pairs.get(symbol)
+            if pair is None:
+                continue
+
+            sz = sizing.get(symbol)
+
+            logger.warning(
+                f"RECONCILE {symbol}: actual={actual_qty} target={target}, "
+                f"correcting {action} {qty}"
+            )
+
+            try:
+                trade = self.broker.place_market_order(
+                    pair.front.contract, action, qty,
+                )
+                fill = self.broker.get_fill_info(trade)
+                rec = {
+                    "type": "reconcile",
+                    "symbol": symbol,
+                    "action": action,
+                    "quantity": qty,
+                    "fill_price": fill.avg_fill_price,
+                    "commission": fill.commission,
+                    "status": trade.orderStatus.status,
+                    "target_contracts": target,
+                    "current_contracts": actual_qty,
+                }
+                if sz:
+                    rec["bar_close"] = sz.last_price
+
+                if trade.orderStatus.status == "Filled":
+                    logger.info(
+                        f"RECONCILE {symbol}: corrected — "
+                        f"{action} {qty} @ {fill.avg_fill_price}"
+                    )
+                else:
+                    logger.error(
+                        f"RECONCILE {symbol}: correction not filled "
+                        f"(status={trade.orderStatus.status})"
+                    )
+                    rec["error"] = f"Correction not filled: {trade.orderStatus.status}"
+
+                records.append(rec)
+
+            except Exception as e:
+                logger.error(f"RECONCILE {symbol}: correction failed: {e}")
+                records.append({
+                    "type": "reconcile",
+                    "symbol": symbol,
+                    "action": action,
+                    "quantity": qty,
+                    "error": str(e),
+                    "status": "FAILED",
+                    "target_contracts": target,
+                    "current_contracts": actual_qty,
+                })
+
+        # Final verification
+        if self.broker.is_connected:
+            final = self.broker.get_positions_by_symbol()
+            still_wrong = []
+            for symbol, target in target_contracts.items():
+                actual = final.get(symbol)
+                actual_qty = int(actual.position) if actual else 0
+                if actual_qty != target:
+                    still_wrong.append(f"{symbol}: actual={actual_qty} target={target}")
+
+            if still_wrong:
+                msg = "POSITIONS STILL MISMATCHED AFTER RECONCILIATION: " + "; ".join(still_wrong)
+                logger.critical(msg)
+                records.append({
+                    "type": "reconcile_failed",
+                    "symbol": "",
+                    "error": msg,
+                    "status": "FAILED",
+                })
+            else:
+                logger.info("Final verification: all positions correct")
 
         return records
 
@@ -347,14 +504,14 @@ class OrderManager:
         symbol: str,
         pair: ContractPair,
         current_qty: int,
-    ) -> dict | None:
+    ) -> tuple[dict | None, "Trade | None"]:
         """Execute a contract roll via calendar spread order.
 
-        Returns execution record dict or None if roll skipped.
+        Returns (record, trade) — trade is needed for pending tracking.
         """
         if pair.next is None:
             logger.error(f"{symbol}: roll needed but no next contract available")
-            return None
+            return None, None
 
         logger.info(
             f"{symbol}: rolling {pair.front.local_symbol} → "
@@ -383,11 +540,11 @@ class OrderManager:
                 "status": trade.orderStatus.status,
             }
             logger.info(
-                f"{symbol}: roll complete — "
+                f"{symbol}: roll — "
                 f"{pair.front.local_symbol} → {pair.next.local_symbol}, "
                 f"status={trade.orderStatus.status}"
             )
-            return record
+            return record, trade
 
         except Exception as e:
             logger.error(f"{symbol}: roll failed: {e}")
@@ -399,7 +556,7 @@ class OrderManager:
                 "quantity": current_qty,
                 "error": str(e),
                 "status": "FAILED",
-            }
+            }, None
 
     def _execute_reversal(
         self,
@@ -493,14 +650,14 @@ class OrderManager:
         symbol: str,
         pair: ContractPair,
         delta: PositionDelta,
-    ) -> dict | None:
+    ) -> tuple[dict | None, "Trade | None"]:
         """Execute a simple position adjustment (increase or decrease)."""
         contract = pair.front.contract
         action = delta.action
         qty = abs(delta.delta)
 
         if qty == 0:
-            return None
+            return None, None
 
         logger.info(f"{symbol}: {action} {qty} contracts")
 
@@ -515,7 +672,7 @@ class OrderManager:
                 "fill_price": fill.avg_fill_price,
                 "commission": fill.commission,
                 "status": trade.orderStatus.status,
-            }
+            }, trade
         except Exception as e:
             logger.error(f"{symbol}: adjustment failed: {e}")
             return {
@@ -525,7 +682,7 @@ class OrderManager:
                 "quantity": qty,
                 "error": str(e),
                 "status": "FAILED",
-            }
+            }, None
 
     def _get_last_price(self, pair: ContractPair) -> float:
         """Get last traded price for the front contract.

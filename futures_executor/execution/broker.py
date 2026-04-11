@@ -244,6 +244,62 @@ class BrokerConnection:
             commission=commission,
         )
 
+    def cancel_order(self, trade: Trade, timeout: float = 10) -> bool:
+        """Cancel an order. Returns True if cancelled/inactive."""
+        if trade.isDone():
+            return True
+        self.ib.cancelOrder(trade.order)
+        elapsed = 0.0
+        while not trade.isDone() and elapsed < timeout:
+            self.ib.sleep(0.5)
+            elapsed += 0.5
+        cancelled = trade.orderStatus.status in ("Cancelled", "Inactive")
+        if not cancelled:
+            logger.warning(
+                f"Order {trade.order.orderId} not cancelled after {timeout}s "
+                f"(status={trade.orderStatus.status})"
+            )
+        return cancelled
+
+    def cancel_all_open(self, timeout: float = 10) -> int:
+        """Cancel all open orders. Returns count cancelled."""
+        trades = self.ib.openTrades()
+        if not trades:
+            return 0
+        for t in trades:
+            if not t.isDone():
+                self.ib.cancelOrder(t.order)
+        self.ib.sleep(min(timeout, 5))
+        n = sum(1 for t in trades if t.orderStatus.status in ("Cancelled", "Inactive"))
+        logger.info(f"Cancelled {n}/{len(trades)} open orders")
+        return n
+
+    def reconnect(self) -> bool:
+        """Reconnect if disconnected. Returns True if connected."""
+        if self.is_connected:
+            return True
+        logger.info("Reconnecting to IB Gateway...")
+        try:
+            self.ib.disconnect()
+        except Exception:
+            pass
+        try:
+            self.ib = IB()
+            self.ib.connect(
+                self.settings.host,
+                self.settings.port,
+                clientId=self.settings.client_id,
+                readonly=self.settings.readonly,
+                timeout=self.settings.timeout,
+            )
+            self._connected = True
+            logger.info("Reconnected to IB Gateway")
+            return True
+        except Exception as e:
+            logger.error(f"Reconnect failed: {e}")
+            self._connected = False
+            return False
+
     def sleep(self, seconds: float) -> None:
         """IB-aware sleep (processes messages while waiting)."""
         self.ib.sleep(seconds)

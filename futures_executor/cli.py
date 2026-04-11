@@ -200,18 +200,17 @@ def cmd_run_once(args):
                     rec.get("symbol", "?"),
                     rec.get("error", "unknown error"),
                 )
-            else:
-                if event_type == "roll":
-                    n_rolls += 1
-                    notifier.notify_roll(
-                        rec["symbol"],
-                        rec.get("from_month", ""),
-                        rec.get("to_month", ""),
-                        rec.get("quantity", 0),
-                        status,
-                    )
-                else:
-                    n_orders += 1
+            elif event_type == "roll":
+                n_rolls += 1
+                notifier.notify_roll(
+                    rec["symbol"],
+                    rec.get("from_month", ""),
+                    rec.get("to_month", ""),
+                    rec.get("quantity", 0),
+                    status,
+                )
+            elif event_type in ("adjustment", "close", "open", "reconcile"):
+                n_orders += 1
 
             total_commission += commission
 
