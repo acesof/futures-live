@@ -26,21 +26,23 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PositionDelta:
     """Difference between target and current positions for one instrument."""
+
     symbol: str
     current_contracts: int
     target_contracts: int
-    delta: int             # target - current (signed)
-    action: str            # "BUY", "SELL", or "HOLD"
-    is_reversal: bool      # flipping sign (long→short or vice versa)
-    needs_roll: bool       # roll required before/during rebalance
+    delta: int  # target - current (signed)
+    action: str  # "BUY", "SELL", or "HOLD"
+    is_reversal: bool  # flipping sign (long→short or vice versa)
+    needs_roll: bool  # roll required before/during rebalance
 
 
 @dataclass
 class SizingResult:
     """Contract sizing output for one instrument."""
+
     symbol: str
-    target_signal: float       # sized position (fraction of capital)
-    target_contracts: int      # signed
+    target_signal: float  # sized position (fraction of capital)
+    target_contracts: int  # signed
     notional_per_contract: float
     multiplier: float
     last_price: float
@@ -64,13 +66,15 @@ def compute_contract_size(
 
     if notional_per_contract <= 0:
         return SizingResult(
-            symbol="", target_signal=signal, target_contracts=0,
+            symbol="",
+            target_signal=signal,
+            target_contracts=0,
             notional_per_contract=notional_per_contract,
-            multiplier=multiplier, last_price=last_price,
+            multiplier=multiplier,
+            last_price=last_price,
         )
 
-    raw = (signal * equity * config.portfolio_leverage
-           / notional_per_contract)
+    raw = signal * equity * config.portfolio_leverage / notional_per_contract
 
     target = round(raw)
 
@@ -139,8 +143,10 @@ def compute_position_diff(
 
     # Reversal = flipping sign (long→short or short→long)
     is_reversal = (
-        current_contracts > 0 and target_contracts < 0
-        or current_contracts < 0 and target_contracts > 0
+        current_contracts > 0
+        and target_contracts < 0
+        or current_contracts < 0
+        and target_contracts > 0
     )
 
     # Determine if delta passes thresholds
@@ -241,7 +247,13 @@ class OrderManager:
 
         Returns list of dicts with execution details for audit logging.
         """
-        current_positions = self.broker.get_positions_by_symbol()
+        all_positions = self.broker.get_positions()
+        current_positions: dict[str, BrokerPosition] = {}
+        for pos in all_positions:
+            if pos.symbol in current_positions:
+                current_positions[pos.symbol].position += pos.position
+            else:
+                current_positions[pos.symbol] = pos
         records = []
 
         # Step 1: Size each instrument
@@ -276,7 +288,9 @@ class OrderManager:
         # Step 2: Margin cap
         available_margin = equity * self.config.execution.margin_cap
         sizing = apply_margin_cap(
-            sizing, self.config.instruments, available_margin,
+            sizing,
+            self.config.instruments,
+            available_margin,
         )
 
         # Build target_contracts map for reconciliation
@@ -303,7 +317,9 @@ class OrderManager:
 
         # Step 4: Enforce safety limits
         deltas = enforce_safety_limits(
-            deltas, current_positions, self.config.safety,
+            deltas,
+            current_positions,
+            self.config.safety,
         )
         # Update targets after safety clamping
         for sym, d in deltas.items():
@@ -316,7 +332,8 @@ class OrderManager:
             pair = contract_pairs[symbol]
             sz = sizing.get(symbol)
 
-            def _enrich(rec: dict, _sz=sz, _delta=delta) -> dict:
+            def _enrich(rec: dict, _sz=sz, _delta=delta, _sym=symbol) -> dict:
+                rec.setdefault("symbol", _sym)
                 if _sz:
                     rec["bar_close"] = _sz.last_price
                     rec["target_contracts"] = _sz.target_contracts
@@ -327,10 +344,16 @@ class OrderManager:
             # Handle rolls via calendar spread
             rolled = False
             if delta.needs_roll and pair.next is not None:
-                current = current_positions.get(symbol)
-                if current and current.position != 0:
+                front_qty = sum(
+                    int(p.position)
+                    for p in all_positions
+                    if p.symbol == symbol and p.contract_month == pair.front.expiry_str
+                )
+                if front_qty != 0:
                     roll_record, roll_trade = self._execute_roll(
-                        symbol, pair, int(current.position),
+                        symbol,
+                        pair,
+                        front_qty,
                     )
                     if roll_record:
                         records.append(_enrich(roll_record))
@@ -384,7 +407,9 @@ class OrderManager:
 
         # Step 7: Reconcile — re-read positions vs targets
         reconcile_records = self._reconcile(
-            target_contracts, contract_pairs, sizing,
+            target_contracts,
+            contract_pairs,
+            sizing,
         )
         records.extend(reconcile_records)
 
@@ -403,12 +428,14 @@ class OrderManager:
         if not self.broker.is_connected:
             if not self.broker.reconnect():
                 logger.error("Cannot reconcile — reconnect failed")
-                return [{
-                    "type": "reconcile_error",
-                    "symbol": "",
-                    "error": "Reconnect failed, positions unverified",
-                    "status": "FAILED",
-                }]
+                return [
+                    {
+                        "type": "reconcile_error",
+                        "symbol": "",
+                        "error": "Reconnect failed, positions unverified",
+                        "status": "FAILED",
+                    }
+                ]
 
         actual_positions = self.broker.get_positions_by_symbol()
 
@@ -444,7 +471,9 @@ class OrderManager:
 
             try:
                 trade = self.broker.place_market_order(
-                    pair.front.contract, action, qty,
+                    pair.front.contract,
+                    action,
+                    qty,
                 )
                 fill = self.broker.get_fill_info(trade)
                 rec = {
@@ -477,16 +506,18 @@ class OrderManager:
 
             except Exception as e:
                 logger.error(f"RECONCILE {symbol}: correction failed: {e}")
-                records.append({
-                    "type": "reconcile",
-                    "symbol": symbol,
-                    "action": action,
-                    "quantity": qty,
-                    "error": str(e),
-                    "status": "FAILED",
-                    "target_contracts": target,
-                    "current_contracts": actual_qty,
-                })
+                records.append(
+                    {
+                        "type": "reconcile",
+                        "symbol": symbol,
+                        "action": action,
+                        "quantity": qty,
+                        "error": str(e),
+                        "status": "FAILED",
+                        "target_contracts": target,
+                        "current_contracts": actual_qty,
+                    }
+                )
 
         # Final verification
         if self.broker.is_connected:
@@ -499,14 +530,18 @@ class OrderManager:
                     still_wrong.append(f"{symbol}: actual={actual_qty} target={target}")
 
             if still_wrong:
-                msg = "POSITIONS STILL MISMATCHED AFTER RECONCILIATION: " + "; ".join(still_wrong)
+                msg = "POSITIONS STILL MISMATCHED AFTER RECONCILIATION: " + "; ".join(
+                    still_wrong
+                )
                 logger.critical(msg)
-                records.append({
-                    "type": "reconcile_failed",
-                    "symbol": "",
-                    "error": msg,
-                    "status": "FAILED",
-                })
+                records.append(
+                    {
+                        "type": "reconcile_failed",
+                        "symbol": "",
+                        "error": msg,
+                        "status": "FAILED",
+                    }
+                )
             else:
                 logger.info("Final verification: all positions correct")
 
@@ -595,28 +630,34 @@ class OrderManager:
 
         try:
             trade = self.broker.place_market_order(
-                contract, close_action, close_qty,
+                contract,
+                close_action,
+                close_qty,
             )
             fill = self.broker.get_fill_info(trade)
-            records.append({
-                "type": "close",
-                "symbol": symbol,
-                "action": close_action,
-                "quantity": close_qty,
-                "fill_price": fill.avg_fill_price,
-                "commission": fill.commission,
-                "status": trade.orderStatus.status,
-            })
+            records.append(
+                {
+                    "type": "close",
+                    "symbol": symbol,
+                    "action": close_action,
+                    "quantity": close_qty,
+                    "fill_price": fill.avg_fill_price,
+                    "commission": fill.commission,
+                    "status": trade.orderStatus.status,
+                }
+            )
         except Exception as e:
             logger.error(f"{symbol}: close leg of reversal failed: {e}")
-            records.append({
-                "type": "close",
-                "symbol": symbol,
-                "action": close_action,
-                "quantity": close_qty,
-                "error": str(e),
-                "status": "FAILED",
-            })
+            records.append(
+                {
+                    "type": "close",
+                    "symbol": symbol,
+                    "action": close_action,
+                    "quantity": close_qty,
+                    "error": str(e),
+                    "status": "FAILED",
+                }
+            )
             return records  # Don't open new side if close failed
 
         # Step 2: Open new direction
@@ -633,28 +674,34 @@ class OrderManager:
 
         try:
             trade = self.broker.place_market_order(
-                contract, open_action, open_qty,
+                contract,
+                open_action,
+                open_qty,
             )
             fill = self.broker.get_fill_info(trade)
-            records.append({
-                "type": "open",
-                "symbol": symbol,
-                "action": open_action,
-                "quantity": open_qty,
-                "fill_price": fill.avg_fill_price,
-                "commission": fill.commission,
-                "status": trade.orderStatus.status,
-            })
+            records.append(
+                {
+                    "type": "open",
+                    "symbol": symbol,
+                    "action": open_action,
+                    "quantity": open_qty,
+                    "fill_price": fill.avg_fill_price,
+                    "commission": fill.commission,
+                    "status": trade.orderStatus.status,
+                }
+            )
         except Exception as e:
             logger.error(f"{symbol}: open leg of reversal failed: {e}")
-            records.append({
-                "type": "open",
-                "symbol": symbol,
-                "action": open_action,
-                "quantity": open_qty,
-                "error": str(e),
-                "status": "FAILED",
-            })
+            records.append(
+                {
+                    "type": "open",
+                    "symbol": symbol,
+                    "action": open_action,
+                    "quantity": open_qty,
+                    "error": str(e),
+                    "status": "FAILED",
+                }
+            )
 
         return records
 
@@ -704,7 +751,10 @@ class OrderManager:
         """
         try:
             ticker = self.broker.ib.reqMktData(
-                pair.front.contract, "", True, False,
+                pair.front.contract,
+                "",
+                True,
+                False,
             )
             self.broker.ib.sleep(2)
 

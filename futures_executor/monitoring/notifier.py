@@ -32,9 +32,11 @@ class SignalNotifier:
             result = subprocess.run(
                 [
                     self.settings.cli_path,
-                    "-a", self.settings.account,
+                    "-a",
+                    self.settings.account,
                     "send",
-                    "-m", message,
+                    "-m",
+                    message,
                     self.settings.recipient,
                 ],
                 capture_output=True,
@@ -84,7 +86,9 @@ class SignalNotifier:
 
         # Per-order detail
         if records:
-            lines.append(f"Orders executed: {n_orders} | Rolls: {n_rolls} | Errors: {n_errors}")
+            lines.append(
+                f"Orders executed: {n_orders} | Rolls: {n_rolls} | Errors: {n_errors}"
+            )
             for rec in records:
                 status = rec.get("status", "?")
                 event_type = rec.get("type", "?")
@@ -94,7 +98,12 @@ class SignalNotifier:
                     from_m = rec.get("from_month", "?")
                     to_m = rec.get("to_month", "?")
                     qty = rec.get("quantity", "?")
-                    lines.append(f"  ROLL {symbol}: {from_m} -> {to_m}, qty={qty} -> {status}")
+                    lines.append(
+                        f"  ROLL {symbol}: {from_m} -> {to_m}, qty={qty} -> {status}"
+                    )
+                elif event_type in ("reconcile_error", "reconcile_failed"):
+                    error = rec.get("error", "unknown")
+                    lines.append(f"  {event_type.upper()}: {error} -> {status}")
                 else:
                     action = rec.get("action", "?")
                     qty = rec.get("quantity", "?")
@@ -106,7 +115,9 @@ class SignalNotifier:
                         sign = 1.0 if action == "BUY" else -1.0
                         slip = sign * (fill - bar_close)
                         slip_str = f" (slip={slip:+.4f})"
-                    lines.append(f"  {action} {qty} {symbol} {fill_str} -> {status}{slip_str}")
+                    lines.append(
+                        f"  {action} {qty} {symbol} {fill_str} -> {status}{slip_str}"
+                    )
         else:
             lines.append("No orders executed")
         lines.append("")

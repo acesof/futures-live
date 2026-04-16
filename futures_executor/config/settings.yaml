@@ -23,6 +23,7 @@ instruments:
     portfolio_symbol: GC
     multiplier: 10.0       # $10 per point (Micro GC)
     margin: 800
+    delivery_buffer_days: 14
 
 roll:
   days_before_expiry: 7
