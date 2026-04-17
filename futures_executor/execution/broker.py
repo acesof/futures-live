@@ -170,8 +170,11 @@ class BrokerConnection:
         if quantity == 0:
             raise ValueError("Spread quantity cannot be zero")
 
-        # For positive quantity: sell front, buy next
-        # For negative quantity: buy front, sell next
+        # IB combo leg actions are interpreted relative to the BAG order side.
+        # Use BUY orders for both directions so the leg actions below map
+        # directly to the desired fills:
+        #   positive quantity -> SELL front, BUY next
+        #   negative quantity -> BUY front, SELL next
         if quantity > 0:
             front_action = "SELL"
             next_action = "BUY"
@@ -180,7 +183,7 @@ class BrokerConnection:
         else:
             front_action = "BUY"
             next_action = "SELL"
-            order_action = "SELL"
+            order_action = "BUY"
             order_qty = abs(quantity)
 
         spread = Contract()

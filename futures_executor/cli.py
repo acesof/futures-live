@@ -1,4 +1,4 @@
-"""Futures executor CLI — run-once, status, flatten, roll-status."""
+"""Futures executor CLI — run-once, status, flatten, roll-status, manual-roll."""
 
 import argparse
 import logging
@@ -442,6 +442,107 @@ def cmd_roll_status(args):
     return 0
 
 
+def cmd_manual_roll(args):
+    """Manually roll a single symbol's front-month position to the next contract."""
+    config = load_settings(CONFIG_DIR)
+
+    from futures_executor.data.contract_resolver import ContractResolver
+    from futures_executor.execution.broker import BrokerConnection
+    from futures_executor.monitoring.audit import AuditLog
+    from futures_executor.monitoring.notifier import SignalNotifier
+
+    instrument = next(
+        (inst for inst in config.instruments if inst.symbol == args.symbol),
+        None,
+    )
+    if instrument is None:
+        print(f"Unknown instrument: {args.symbol}")
+        return 1
+
+    broker = BrokerConnection(config.broker)
+    audit = AuditLog(config.audit.db_path)
+    notifier = SignalNotifier(config.signal)
+    today = date.today().isoformat()
+
+    try:
+        broker.connect()
+    except Exception as e:
+        print(f"Connection failed: {e}")
+        audit.close()
+        return 1
+
+    try:
+        resolver = ContractResolver(broker.ib, config.roll)
+        pair = resolver.resolve(instrument)
+
+        if pair.next is None:
+            print(f"{args.symbol}: no next contract available for roll.")
+            return 1
+
+        positions = broker.get_positions()
+        front_qty = sum(
+            int(pos.position)
+            for pos in positions
+            if pos.symbol == args.symbol
+            and pos.contract_month == pair.front.expiry_str
+        )
+
+        if front_qty == 0:
+            print(
+                f"{args.symbol}: no position in front contract "
+                f"{pair.front.local_symbol} to roll."
+            )
+            return 0
+
+        direction = "long" if front_qty > 0 else "short"
+        print(
+            f"{args.symbol}: roll {pair.front.local_symbol} -> "
+            f"{pair.next.local_symbol} for {abs(front_qty)} {direction} contracts"
+        )
+
+        if not args.confirm:
+            print("\nAdd --confirm to execute.")
+            return 0
+
+        trade = broker.place_spread_order(
+            symbol=args.symbol,
+            exchange=pair.front.exchange,
+            currency=pair.front.currency,
+            front_con_id=pair.front.con_id,
+            next_con_id=pair.next.con_id,
+            quantity=front_qty,
+        )
+        fill = broker.get_fill_info(trade)
+
+        audit.log_execution(
+            run_date=today,
+            symbol=args.symbol,
+            event_type="roll",
+            quantity=front_qty,
+            fill_price=fill.avg_fill_price,
+            commission=fill.commission,
+            status=trade.orderStatus.status,
+        )
+        notifier.notify_roll(
+            args.symbol,
+            pair.front.expiry_str,
+            pair.next.expiry_str,
+            front_qty,
+            trade.orderStatus.status,
+        )
+
+        print(
+            f"{args.symbol}: rolled {pair.front.local_symbol} -> "
+            f"{pair.next.local_symbol} qty={front_qty:+d} "
+            f"status={trade.orderStatus.status} fill={fill.avg_fill_price:.4f}"
+        )
+        return 0 if trade.orderStatus.status == "Filled" else 1
+
+    finally:
+        broker.disconnect()
+        audit.close()
+
+
 def cmd_audit(args):
     """Show recent execution history."""
     config = load_settings(CONFIG_DIR)
@@ -676,6 +777,19 @@ def main():
     # roll-status
     p_roll = sub.add_parser("roll-status", help="Show roll status for all instruments")
     p_roll.set_defaults(func=cmd_roll_status)
+
+    # manual-roll
+    p_manual_roll = sub.add_parser(
+        "manual-roll",
+        help="Roll one symbol's front-month position to the next contract",
+    )
+    p_manual_roll.add_argument("symbol", help="Execution symbol, e.g. MCL")
+    p_manual_roll.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Actually execute the roll order",
+    )
+    p_manual_roll.set_defaults(func=cmd_manual_roll)
 
     # audit
     p_audit = sub.add_parser("audit", help="Show execution history")
