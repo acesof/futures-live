@@ -7,11 +7,16 @@ from datetime import date
 from pathlib import Path
 
 from futures_executor.config.loader import load_settings, load_strategies
+from futures_executor.state import (
+    get_active_contracts,
+    load_executor_state,
+    save_executor_state,
+    set_active_contract,
+)
 
 logger = logging.getLogger("futures_executor")
 
 CONFIG_DIR = Path(__file__).parent / "config"
-STATE_FILE = Path("data/executor_state.json")
 
 
 def _setup_logging(verbose: bool = False):
@@ -25,17 +30,11 @@ def _setup_logging(verbose: bool = False):
 
 def _load_state() -> dict:
     """Load persistent executor state (last rebalance date, etc.)."""
-    import json
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
+    return load_executor_state()
 
 
 def _save_state(state: dict):
-    import json
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    save_executor_state(state)
 
 
 def _check_kill_switch(config) -> bool:
@@ -103,7 +102,10 @@ def cmd_run_once(args):
 
         # Resolve contracts
         resolver = ContractResolver(broker.ib, config.roll)
-        contract_pairs = resolver.resolve_all(config.instruments)
+        contract_pairs = resolver.resolve_all(
+            config.instruments,
+            active_contracts=get_active_contracts(state),
+        )
 
         if not contract_pairs:
             logger.critical("No contracts resolved")
@@ -292,7 +294,10 @@ def cmd_status(args):
         print(f"  Unrealized:   ${account.unrealized_pnl:>12,.2f}")
         print(f"  Realized:     ${account.realized_pnl:>12,.2f}")
 
+        state = _load_state()
+        active_contracts = get_active_contracts(state)
         positions = broker.get_positions_by_symbol()
+        raw_positions = broker.get_positions()
         print(f"\nPositions ({len(positions)}):")
         if positions:
             for sym, pos in sorted(positions.items()):
@@ -304,15 +309,31 @@ def cmd_status(args):
             print("  (none)")
 
         resolver = ContractResolver(broker.ib, config.roll)
-        pairs = resolver.resolve_all(config.instruments)
-        print(f"\nContracts ({len(pairs)}):")
-        for sym, pair in sorted(pairs.items()):
+        exec_pairs = resolver.resolve_all(
+            config.instruments,
+            active_contracts=active_contracts,
+        )
+        raw_pairs = resolver.resolve_all(config.instruments)
+        print(f"\nContracts ({len(exec_pairs)}):")
+        held_by_symbol: dict[str, list[str]] = {}
+        for pos in raw_positions:
+            if pos.position == 0:
+                continue
+            held_by_symbol.setdefault(pos.symbol, []).append(pos.contract_month)
+
+        for sym in sorted(exec_pairs):
+            pair = exec_pairs[sym]
+            raw_pair = raw_pairs[sym]
             roll_flag = " [ROLL DUE]" if pair.roll_due else ""
             hard_flag = " [HARD DEADLINE]" if pair.hard_deadline else ""
             next_sym = pair.next.local_symbol if pair.next else "N/A"
+            held_months = ",".join(sorted(held_by_symbol.get(sym, []))) or "none"
+            active_month = active_contracts.get(sym, "-")
             print(
-                f"  {sym:6s}  front={pair.front.local_symbol:8s} "
-                f"(exp {pair.front.expiry}, {pair.days_to_expiry}d)  "
+                f"  {sym:6s}  held={held_months:8s} "
+                f"active={active_month:8s} "
+                f"front={pair.front.local_symbol:8s} "
+                f"resolver={raw_pair.front.local_symbol:8s} "
                 f"next={next_sym}"
                 f"{roll_flag}{hard_flag}"
             )
@@ -413,7 +434,11 @@ def cmd_roll_status(args):
 
     try:
         resolver = ContractResolver(broker.ib, config.roll)
-        pairs = resolver.resolve_all(config.instruments)
+        state = _load_state()
+        pairs = resolver.resolve_all(
+            config.instruments,
+            active_contracts=get_active_contracts(state),
+        )
 
         print(f"\nRoll Status ({date.today()}):")
         print(f"{'Symbol':8s} {'Front':10s} {'Expiry':12s} {'Days':>5s} "
@@ -513,6 +538,9 @@ def cmd_manual_roll(args):
             quantity=front_qty,
         )
         fill = broker.get_fill_info(trade)
+        if trade.orderStatus.status == "Filled":
+            state = set_active_contract(state, args.symbol, pair.next.expiry_str)
+            _save_state(state)
 
         audit.log_execution(
             run_date=today,

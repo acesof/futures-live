@@ -1,8 +1,8 @@
-"""Contract resolution: front/next month, roll dates, contract details."""
+"""Contract resolution: front/next month, active overrides, contract details."""
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 
 from ib_insync import IB, Contract, ContractDetails
 
@@ -46,7 +46,11 @@ class ContractResolver:
         self.ib = ib
         self.roll_config = roll_config
 
-    def resolve(self, instrument: InstrumentSettings) -> ContractPair:
+    def resolve(
+        self,
+        instrument: InstrumentSettings,
+        active_contract_month: str | None = None,
+    ) -> ContractPair:
         """Resolve front and next contracts for an instrument.
 
         Queries IBKR for all available expiries, picks front (nearest
@@ -89,14 +93,26 @@ class ContractResolver:
                 f"(all {len(details_list)} contracts expired)"
             )
 
-        # Front = nearest
-        front_exp, front_details = candidates[0]
+        selected_idx = 0
+        if active_contract_month:
+            for idx, (_exp, details) in enumerate(candidates):
+                if details.contract.lastTradeDateOrContractMonth == active_contract_month:
+                    selected_idx = idx
+                    logger.info(
+                        f"{instrument.symbol}: honoring active contract override "
+                        f"{active_contract_month}"
+                    )
+                    break
+
+        # Front = nearest, unless active override selects a later valid month
+        front_exp, front_details = candidates[selected_idx]
         front = self._to_resolved(front_details, front_exp)
 
-        # Next = second nearest (if available)
+        # Next = following month after the selected front (if available)
         next_contract = None
-        if len(candidates) > 1:
-            next_exp, next_details = candidates[1]
+        next_exp = None
+        if len(candidates) > selected_idx + 1:
+            next_exp, next_details = candidates[selected_idx + 1]
             next_contract = self._to_resolved(next_details, next_exp)
 
         # Delivery buffer: if front is inside IBKR's delivery window,
@@ -116,8 +132,8 @@ class ContractResolver:
             front = next_contract
             front_exp = next_exp
             next_contract = None
-            if len(candidates) > 2:
-                third_exp, third_details = candidates[2]
+            if len(candidates) > selected_idx + 2:
+                third_exp, third_details = candidates[selected_idx + 2]
                 next_contract = self._to_resolved(third_details, third_exp)
 
         # Qualify the front contract
@@ -157,13 +173,18 @@ class ContractResolver:
         )
 
     def resolve_all(
-        self, instruments: list[InstrumentSettings]
+        self,
+        instruments: list[InstrumentSettings],
+        active_contracts: dict[str, str] | None = None,
     ) -> dict[str, ContractPair]:
         """Resolve contracts for all instruments."""
         result = {}
         for inst in instruments:
             try:
-                result[inst.symbol] = self.resolve(inst)
+                result[inst.symbol] = self.resolve(
+                    inst,
+                    active_contract_month=(active_contracts or {}).get(inst.symbol),
+                )
                 self.ib.sleep(0.5)  # pace IBKR requests
             except Exception as e:
                 logger.error(f"Failed to resolve {inst.symbol}: {e}")

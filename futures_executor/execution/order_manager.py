@@ -19,6 +19,11 @@ from futures_executor.config.loader import (
 )
 from futures_executor.data.contract_resolver import ContractPair
 from futures_executor.execution.broker import BrokerConnection, BrokerPosition
+from futures_executor.state import (
+    load_executor_state,
+    save_executor_state,
+    set_active_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +372,9 @@ class OrderManager:
                             f"skipping adjustment"
                         )
                         continue
+                    state = load_executor_state()
+                    _save = set_active_contract(state, symbol, pair.next.expiry_str)
+                    save_executor_state(_save)
                     rolled = True
 
             # After successful roll, adjustments must target the new contract
