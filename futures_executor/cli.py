@@ -319,7 +319,7 @@ def cmd_status(args):
         for pos in raw_positions:
             if pos.position == 0:
                 continue
-            held_by_symbol.setdefault(pos.symbol, []).append(pos.contract_month)
+            held_by_symbol.setdefault(pos.symbol, []).append(pos.local_symbol)
 
         for sym in sorted(exec_pairs):
             pair = exec_pairs[sym]
@@ -328,7 +328,14 @@ def cmd_status(args):
             hard_flag = " [HARD DEADLINE]" if pair.hard_deadline else ""
             next_sym = pair.next.local_symbol if pair.next else "N/A"
             held_months = ",".join(sorted(held_by_symbol.get(sym, []))) or "none"
-            active_month = active_contracts.get(sym, "-")
+            active_month = "-"
+            active_expiry = active_contracts.get(sym)
+            if active_expiry == pair.front.expiry_str:
+                active_month = pair.front.local_symbol
+            elif active_expiry and pair.next and active_expiry == pair.next.expiry_str:
+                active_month = pair.next.local_symbol
+            elif active_expiry:
+                active_month = active_expiry
             print(
                 f"  {sym:6s}  held={held_months:8s} "
                 f"active={active_month:8s} "

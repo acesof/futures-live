@@ -32,6 +32,7 @@ class BrokerPosition:
     symbol: str
     con_id: int
     contract_month: str
+    local_symbol: str
     exchange: str
     position: float  # signed: +long, -short
     avg_cost: float
@@ -113,6 +114,7 @@ class BrokerConnection:
                 symbol=c.symbol,
                 con_id=c.conId,
                 contract_month=c.lastTradeDateOrContractMonth or "",
+                local_symbol=c.localSymbol or c.lastTradeDateOrContractMonth or "",
                 exchange=c.exchange,
                 position=float(pos.position),
                 avg_cost=float(pos.avgCost),
