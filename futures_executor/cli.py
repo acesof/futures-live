@@ -303,7 +303,7 @@ def cmd_status(args):
             for sym, pos in sorted(positions.items()):
                 print(
                     f"  {sym:6s}  {pos.position:+6.0f} contracts  "
-                    f"({pos.contract_month})  avg={pos.avg_cost:.2f}"
+                    f"({pos.display_contract})  avg={pos.avg_cost:.2f}"
                 )
         else:
             print("  (none)")
@@ -319,28 +319,31 @@ def cmd_status(args):
         for pos in raw_positions:
             if pos.position == 0:
                 continue
-            held_by_symbol.setdefault(pos.symbol, []).append(pos.local_symbol)
+            held_by_symbol.setdefault(pos.symbol, []).append(pos.display_contract)
 
         for sym in sorted(exec_pairs):
             pair = exec_pairs[sym]
             raw_pair = raw_pairs[sym]
             roll_flag = " [ROLL DUE]" if pair.roll_due else ""
             hard_flag = " [HARD DEADLINE]" if pair.hard_deadline else ""
-            next_sym = pair.next.local_symbol if pair.next else "N/A"
+            next_sym = (
+                f"{pair.next.local_symbol} ({pair.next.expiry_str})"
+                if pair.next else "N/A"
+            )
             held_months = ",".join(sorted(held_by_symbol.get(sym, []))) or "none"
             active_month = "-"
             active_expiry = active_contracts.get(sym)
             if active_expiry == pair.front.expiry_str:
-                active_month = pair.front.local_symbol
+                active_month = f"{pair.front.local_symbol} ({pair.front.expiry_str})"
             elif active_expiry and pair.next and active_expiry == pair.next.expiry_str:
-                active_month = pair.next.local_symbol
+                active_month = f"{pair.next.local_symbol} ({pair.next.expiry_str})"
             elif active_expiry:
                 active_month = active_expiry
             print(
-                f"  {sym:6s}  held={held_months:8s} "
-                f"active={active_month:8s} "
-                f"front={pair.front.local_symbol:8s} "
-                f"resolver={raw_pair.front.local_symbol:8s} "
+                f"  {sym:6s}  held={held_months} "
+                f"active={active_month} "
+                f"front={pair.front.local_symbol} ({pair.front.expiry_str}) "
+                f"resolver={raw_pair.front.local_symbol} ({raw_pair.front.expiry_str}) "
                 f"next={next_sym}"
                 f"{roll_flag}{hard_flag}"
             )

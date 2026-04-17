@@ -38,6 +38,13 @@ class BrokerPosition:
     avg_cost: float
     multiplier: float
 
+    @property
+    def display_contract(self) -> str:
+        """Human-readable contract display with symbol and expiry."""
+        if self.local_symbol and self.contract_month:
+            return f"{self.local_symbol} ({self.contract_month})"
+        return self.local_symbol or self.contract_month or "-"
+
 
 @dataclass
 class FillInfo:
