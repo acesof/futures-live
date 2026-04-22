@@ -32,7 +32,7 @@ roll:
   merge_with_rebalance_window: 3
 
 execution:
-  portfolio_leverage: 10.0
+  portfolio_leverage: 1.5
   abs_threshold: 1        # min contract delta to trade (noise filter)
   rel_threshold: 0.15     # min % change vs current position to trade (15%)
   gross_exposure_cap: 5.0 # max Σ|sized_j|; proportional scale-down if exceeded (null = no cap)
@@ -52,8 +52,8 @@ data:
   bar_history_dir: data/bars
 
 safety:
-  max_position_contracts: 10
-  max_total_contracts: 30
+  max_position_contracts: 100
+  max_total_contracts: 300
   max_daily_turnover: 20
   kill_switch_file: .kill_switch
   heartbeat_timeout: 300
