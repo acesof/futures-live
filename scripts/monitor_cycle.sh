@@ -58,8 +58,15 @@ FINDINGS_FILE="$(mktemp -t monitor_findings)"
 CHECK_RC="${CHECK_RC:-0}"
 cat "$FINDINGS_FILE" | tee -a "$LOG_FILE"
 if [ "$CHECK_RC" -ne 0 ]; then
+    # Exit code 1 = warning present, 2 = critical present (see
+    # cmd_monitor_check). Pick emoji accordingly.
+    if [ "$CHECK_RC" -ge 2 ]; then
+        MONITOR_EMOJI="🚨"
+    else
+        MONITOR_EMOJI="⚠️"
+    fi
     (cd "$FUTURES_LIVE_DIR" && futures-executor notify \
-        --prefix "🔔 Monitor ($INSTRUMENT_SET)" < "$FINDINGS_FILE") \
+        --prefix "$MONITOR_EMOJI Monitor ($INSTRUMENT_SET)" < "$FINDINGS_FILE") \
         2>&1 | tee -a "$LOG_FILE" || true
 fi
 rm -f "$FINDINGS_FILE"
