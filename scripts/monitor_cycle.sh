@@ -66,7 +66,7 @@ if [ "$CHECK_RC" -ne 0 ]; then
         MONITOR_EMOJI="⚠️"
     fi
     (cd "$FUTURES_LIVE_DIR" && futures-executor notify \
-        --prefix "$MONITOR_EMOJI Monitor ($INSTRUMENT_SET)" < "$FINDINGS_FILE") \
+        --prefix "$MONITOR_EMOJI Futures Monitor ($INSTRUMENT_SET)" < "$FINDINGS_FILE") \
         2>&1 | tee -a "$LOG_FILE" || true
 fi
 rm -f "$FINDINGS_FILE"
