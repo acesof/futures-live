@@ -3,6 +3,7 @@
 import logging
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from futures_executor.config.loader import SignalSettings
 
@@ -70,7 +71,8 @@ class SignalNotifier:
         positions: dict[str, int],
     ) -> str:
         """Build FXE-style rich summary for Signal/logging."""
-        lines = [f"Futures Executor — {run_date}", ""]
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines = [f"Futures Executor — {now}", ""]
 
         # Target signals
         lines.append("Targets:")
