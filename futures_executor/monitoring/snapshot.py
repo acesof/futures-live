@@ -125,14 +125,16 @@ def _multiplier_map(config: ExecutorConfig) -> dict[str, float]:
 def _net_positions(
     broker: BrokerConnection,
     close_prices: dict[str, float],
-    equity_usd: float,
+    equity_account_ccy: float,
+    usd_to_account: float,
     exec_to_portfolio: dict[str, str],
     multiplier_map: dict[str, float],
 ) -> list[PositionSnap]:
     """Convert broker positions to PositionSnap rows keyed on portfolio symbol.
 
-    ``effective_fraction`` is computed broker-side so monitor stays
-    broker-agnostic. Absolute value — sign lives in ``side``.
+    Effective fraction is in ACCOUNT currency:
+      notional_account_ccy = contracts × multiplier × close_usd × usd_to_account
+      effective_fraction   = notional_account_ccy / equity_account_ccy
     """
     raw = broker.get_positions()
     out: list[PositionSnap] = []
@@ -141,10 +143,11 @@ def _net_positions(
         side = "LONG" if p.position > 0 else "SHORT"
         contracts = abs(float(p.position))
         multiplier = float(p.multiplier or multiplier_map.get(p_sym, 1.0))
-        mark = float(close_prices.get(p_sym, 0.0))
+        mark_usd = float(close_prices.get(p_sym, 0.0))
         eff = 0.0
-        if equity_usd > 0 and mark > 0:
-            eff = contracts * multiplier * mark / equity_usd
+        if equity_account_ccy > 0 and mark_usd > 0:
+            notional_account = contracts * multiplier * mark_usd * usd_to_account
+            eff = notional_account / equity_account_ccy
         out.append(PositionSnap(
             label=p.local_symbol or p_sym,
             instrument=p_sym,           # MONITOR KEYS ON PORTFOLIO SYMBOL (stable across rolls)
@@ -166,6 +169,7 @@ def _fills_and_transactions_from_audit(
     run_date: str,
     tracking_since_iso: str,
     close_prices: dict[str, float],
+    usd_to_account: float,
     exec_to_portfolio: dict[str, str],
     multiplier_map: dict[str, float],
 ) -> tuple[list[FillSnap], list[TransactionSnap]]:
@@ -196,7 +200,7 @@ def _fills_and_transactions_from_audit(
     finally:
         conn.close()
 
-    fills = [_row_to_fill(r, close_prices, exec_to_portfolio, multiplier_map)
+    fills = [_row_to_fill(r, close_prices, usd_to_account, exec_to_portfolio, multiplier_map)
              for r in today_rows if _is_real_execution(r)]
     transactions = [_row_to_transaction(r, exec_to_portfolio)
                     for r in window_rows if _is_real_execution(r)]
@@ -220,6 +224,7 @@ def _is_real_execution(row: sqlite3.Row) -> bool:
 def _row_to_fill(
     row: sqlite3.Row,
     close_prices: dict[str, float],
+    usd_to_account: float,
     exec_to_portfolio: dict[str, str],
     multiplier_map: dict[str, float],
 ) -> FillSnap:
@@ -235,8 +240,10 @@ def _row_to_fill(
     slippage_bps: float | None = None
     if fill_price is not None and bar_close is not None and bar_close > 0:
         sign = 1.0 if side == "BUY" else -1.0
-        # USD cost: sign × (fill − close) × multiplier × qty
-        slippage_amount = sign * (fill_price - bar_close) * multiplier * qty
+        # USD cost → account currency: sign × (fill − close) × multiplier × qty × usd_to_account
+        slippage_amount = (
+            sign * (fill_price - bar_close) * multiplier * qty * usd_to_account
+        )
         slippage_bps = sign * (fill_price - bar_close) / bar_close * 10_000.0
 
     return FillSnap(
@@ -317,6 +324,77 @@ def _load_close_prices(audit_db_path: Path, run_date: str) -> dict[str, float]:
         return {k: float(v) for k, v in json.load(f).items()}
 
 
+def _parquet_close_fallback(
+    r_factory_data_dir: Path,
+    instrument_set: str,
+    symbols: list[str],
+) -> dict[str, float]:
+    """Load the latest close per symbol from R-factory's canonical parquet.
+
+    Used when ``close_prices_<date>.json`` is missing (manual snapshot runs,
+    or cron order variations) — monitor_cycle.sh runs ingest-futures-ibkr
+    immediately before snapshot, so the parquet has today's close.
+    """
+    out: dict[str, float] = {}
+    pq_dir = Path(r_factory_data_dir) / "parquet" / instrument_set
+    for sym in symbols:
+        p = pq_dir / f"{sym}.parquet"
+        if not p.exists():
+            continue
+        try:
+            import pandas as pd  # lazy — only needed on fallback
+            df = pd.read_parquet(p)
+            if "Close" in df.columns and len(df):
+                out[sym] = float(df["Close"].iloc[-1])
+        except Exception as e:
+            logger.warning(f"parquet-close fallback failed for {sym}: {e}")
+    return out
+
+
+def _eurusd_spot(broker: BrokerConnection) -> float:
+    """Fetch EUR/USD spot from IBKR. Returns 0.0 on failure (caller handles)."""
+    try:
+        from ib_insync import Contract
+        c = Contract()
+        c.symbol, c.secType, c.exchange, c.currency = "EUR", "CASH", "IDEALPRO", "USD"
+        qualified = broker.ib.qualifyContracts(c)
+        if not qualified:
+            return 0.0
+        ticker = broker.ib.reqMktData(qualified[0], "", snapshot=True, regulatorySnapshot=False)
+        broker.ib.sleep(2.5)
+        price = None
+        for attr in ("last", "close", "marketPrice"):
+            v = getattr(ticker, attr, None)
+            if v and v > 0:
+                price = v
+                break
+        try:
+            broker.ib.cancelMktData(qualified[0])
+        except Exception:
+            pass
+        return float(price) if price else 0.0
+    except Exception as e:
+        logger.warning(f"EUR/USD fetch failed: {e}")
+        return 0.0
+
+
+def _usd_to_account_factor(account_currency: str, eurusd_spot: float) -> float:
+    """Multiplier that converts a USD-denominated amount into the account's
+    base currency. Returns 1.0 for USD-base or any unrecognised currency
+    (logged).
+    """
+    ccy = (account_currency or "").upper()
+    if ccy == "USD":
+        return 1.0
+    if ccy == "EUR":
+        if eurusd_spot and eurusd_spot > 0:
+            return 1.0 / eurusd_spot
+        logger.warning("EUR account but no EUR/USD rate available; using 1.0 (wrong)")
+        return 1.0
+    logger.warning(f"Unsupported account currency {ccy!r}; using 1.0 USD→{ccy} factor")
+    return 1.0
+
+
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
@@ -353,14 +431,41 @@ def build_snapshot(
     exec_to_portfolio = _exec_to_portfolio_map(config)
     multiplier_map = _multiplier_map(config)
 
+    # Fallback: if the persisted close_prices file is missing any
+    # instrument (manual snapshot without prior run-once, or partial
+    # write), read from R-factory's freshly-ingested parquet instead.
+    portfolio_symbols = [exec_to_portfolio[i.symbol] for i in config.instruments]
+    missing = [s for s in portfolio_symbols if s not in close_prices]
+    if missing:
+        fallback = _parquet_close_fallback(
+            Path(config.monitor.r_factory_data_dir), instrument_set, missing,
+        )
+        if fallback:
+            logger.info(f"close_prices parquet-fallback for: {sorted(fallback)}")
+        close_prices.update(fallback)
+
+    # FX conversion USD notional → account currency. EUR-base account
+    # trading USD-denominated futures: fetch EUR/USD from IBKR once and
+    # apply. For USD-base, factor is 1.0.
+    if account.currency.upper() == "USD":
+        eurusd_spot = 0.0
+        usd_to_account = 1.0
+    else:
+        eurusd_spot = _eurusd_spot(broker)
+        usd_to_account = _usd_to_account_factor(account.currency, eurusd_spot)
+        logger.info(
+            f"FX USD→{account.currency}: factor={usd_to_account:.6f} "
+            f"(EURUSD={eurusd_spot:.5f})"
+        )
+
     positions = _net_positions(
-        broker, close_prices, account.equity,
+        broker, close_prices, account.equity, usd_to_account,
         exec_to_portfolio, multiplier_map,
     )
 
     fills, transactions = _fills_and_transactions_from_audit(
         Path(config.audit.db_path), run_date, tracking_since_iso,
-        close_prices, exec_to_portfolio, multiplier_map,
+        close_prices, usd_to_account, exec_to_portfolio, multiplier_map,
     )
 
     # is_v2 is a stable config property — decoupled from the optional

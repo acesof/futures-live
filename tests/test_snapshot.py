@@ -265,6 +265,47 @@ def test_build_snapshot_disabled_position_is_short(tmp_path):
     assert pos.effective_fraction == pytest.approx(1.125)
 
 
+def test_eur_account_applies_usd_to_eur_fx_conversion(tmp_path, monkeypatch):
+    """EUR-base account holding USD-denominated futures: effective_fraction
+    must scale USD notional by (1/eurusd) before dividing by EUR equity.
+    """
+    config = _make_config(tmp_path)
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _seed_audit_db(Path(config.audit.db_path), run_date)
+    _write_targets(tmp_path, run_date, {}, is_v2=True)
+    _write_close_prices(tmp_path, run_date, {"ES": 4520.0})
+    _write_dataset_manifest(tmp_path, _INSTRUMENT_SET, "vtest")
+    strategies_yaml = _write_strategies_yaml(tmp_path)
+
+    # Patch EUR/USD fetch to a deterministic 1.10
+    from futures_executor.monitoring import snapshot as snap_module
+    monkeypatch.setattr(snap_module, "_eurusd_spot", lambda _broker: 1.10)
+
+    positions = [
+        BrokerPosition(
+            symbol="MES", con_id=1, contract_month="202506",
+            local_symbol="MESM6", exchange="CME", position=10.0,
+            avg_cost=22_600.0, multiplier=5.0,
+        ),
+    ]
+    broker = _fake_broker(
+        equity=1_000_000.0, currency="EUR", positions=positions,
+    )
+    snap = build_snapshot(
+        config=config, broker=broker,
+        instrument_set=_INSTRUMENT_SET,
+        tracking_since_iso=_TRACK_SINCE,
+        run_date=run_date,
+        strategies_yaml_path=strategies_yaml,
+    )
+    pos = snap.positions[0]
+    # notional_usd = 10 × 5 × 4520          = 226_000 USD
+    # notional_eur = 226_000 / 1.10         = 205_454.55 EUR
+    # effective_fraction = 205_454.55 / 1_000_000 = 0.20545
+    assert pos.effective_fraction == pytest.approx(0.20545, rel=1e-4)
+    assert snap.account.currency == "EUR"
+
+
 def test_write_snapshot_creates_canonical_path(tmp_path):
     config = _make_config(tmp_path)
     run_date = "2026-05-01"
