@@ -75,6 +75,20 @@ class SignalSettings(BaseModel):
     cli_path: str = "signal-cli"
 
 
+class MonitorSettings(BaseModel):
+    """Live-vs-sim monitor integration (mirrors forex-live's block).
+
+    When ``enabled`` is true, ``fxf snapshot`` writes canonical snapshot
+    JSON into ``r_factory_artifacts_dir/monitor/<set>/snapshots/``.
+    R-factory's monitor reads parquet from
+    ``r_factory_data_dir/parquet/<set>/`` for sim replay.
+    """
+    enabled: bool = False
+    r_factory_artifacts_dir: str = "/Users/acess/projects/R-factory/artifacts"
+    r_factory_data_dir: str = "/Users/acess/projects/R-factory/data"
+    broker_id: str = "ibkr-futures"
+
+
 class ExecutorConfig(BaseModel):
     broker: BrokerSettings = BrokerSettings()
     rfactory_path: str = ""
@@ -86,6 +100,7 @@ class ExecutorConfig(BaseModel):
     safety: SafetySettings = SafetySettings()
     audit: AuditSettings = AuditSettings()
     signal: SignalSettings = SignalSettings()
+    monitor: MonitorSettings = MonitorSettings()
 
 
 class StrategyEntry(BaseModel):

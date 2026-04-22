@@ -1,6 +1,7 @@
-"""Futures executor CLI — run-once, status, flatten, roll-status, manual-roll."""
+"""Futures executor CLI — run-once, status, flatten, roll-status, manual-roll, snapshot, notify."""
 
 import argparse
+import json
 import logging
 import sys
 from datetime import date
@@ -161,6 +162,28 @@ def cmd_run_once(args):
             strategies_config.strategies,
             config,
         )
+
+        # Persist portfolio-symbol targets + close prices alongside audit.db
+        # so `fxf snapshot` can attach exactly what this cycle asked for
+        # (pre-lot-rounding) and compute broker-side effective_fraction /
+        # slippage_amount without needing another IBKR round-trip.
+        try:
+            run_date = today
+            audit_dir = Path(config.audit.db_path).parent
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            with open(audit_dir / f"targets_{run_date}.json", "w") as f:
+                json.dump(
+                    {"targets": dict(portfolio_targets), "is_v2": bool(is_v2)},
+                    f, indent=2,
+                )
+            close_prices = {
+                inst: float(market_data.close[-1, j])
+                for j, inst in enumerate(market_data.instrument_names)
+            }
+            with open(audit_dir / f"close_prices_{run_date}.json", "w") as f:
+                json.dump(close_prices, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to persist targets/close_prices snapshot: {e}")
 
         # Map signals back to execution symbols (NQ→MNQ, ES→MES, ...)
         targets = {}
@@ -605,6 +628,66 @@ def cmd_audit(args):
     return 0
 
 
+def cmd_snapshot(args):
+    """Write the canonical live-vs-sim monitor snapshot JSON."""
+    from datetime import datetime, timedelta, timezone
+    from futures_executor.config.loader import load_settings
+    from futures_executor.execution.broker import BrokerConnection
+    from futures_executor.monitoring.snapshot import build_snapshot, write_snapshot
+
+    config = load_settings(Path(__file__).parent / "config")
+    if not config.monitor.enabled:
+        print("monitor.enabled is false — skipping snapshot write")
+        return 0
+
+    # Generous lower bound for transactions_since — R-factory filters
+    # down to the actual tracking_start on its side.
+    tracking_since = (datetime.now(timezone.utc) - timedelta(days=30)).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    tracking_since_iso = tracking_since.isoformat().replace("+00:00", "Z")
+
+    broker = BrokerConnection(config.broker)
+    try:
+        broker.connect()
+    except Exception as e:
+        logger.critical(f"Failed to connect to IB Gateway: {e}")
+        return 1
+
+    try:
+        snapshot = build_snapshot(
+            config=config, broker=broker,
+            instrument_set=args.instrument_set,
+            tracking_since_iso=tracking_since_iso,
+        )
+        path = write_snapshot(snapshot, Path(config.monitor.r_factory_artifacts_dir))
+        print(f"Snapshot written: {path}")
+    finally:
+        broker.disconnect()
+    return 0
+
+
+def cmd_notify(args):
+    """Send a Signal notification using the configured account/recipient."""
+    from futures_executor.config.loader import load_settings
+    from futures_executor.monitoring.notifier import SignalNotifier
+
+    config = load_settings(Path(__file__).parent / "config")
+    text = args.text
+    if text is None:
+        text = sys.stdin.read()
+    text = (text or "").strip()
+    if not text:
+        print("fxf notify: nothing to send (empty message)", file=sys.stderr)
+        return 0
+
+    notifier = SignalNotifier(config.signal)
+    prefix = args.prefix
+    body = f"{prefix}\n{text}" if prefix else text
+    ok = notifier.send(body)
+    return 0 if ok else 1
+
+
 def cmd_slippage(args):
     """Show per-fill slippage detail (FXE-style)."""
     config = load_settings(CONFIG_DIR)
@@ -838,6 +921,24 @@ def main():
     p_slip = sub.add_parser("slippage", help="Show per-fill slippage detail")
     p_slip.add_argument("-n", "--limit", type=int, default=100, help="Number of fills")
     p_slip.set_defaults(func=cmd_slippage)
+
+    p_snap = sub.add_parser(
+        "snapshot",
+        help="Write canonical monitor snapshot JSON for R-factory",
+    )
+    p_snap.add_argument(
+        "--instrument-set", required=True,
+        help="Instrument set name (matches R-factory set; e.g. futures_mini)",
+    )
+    p_snap.set_defaults(func=cmd_snapshot)
+
+    p_notify = sub.add_parser(
+        "notify",
+        help="Send a Signal notification (reads stdin or --text)",
+    )
+    p_notify.add_argument("--text", type=str, default=None, help="Message body (overrides stdin)")
+    p_notify.add_argument("--prefix", type=str, default=None, help="Prefix line prepended to the message")
+    p_notify.set_defaults(func=cmd_notify)
 
     args = parser.parse_args()
     _setup_logging(args.verbose)
