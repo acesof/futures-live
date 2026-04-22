@@ -66,3 +66,9 @@ signal:
   recipient: "+37069693181"
   enabled: true
   cli_path: /opt/homebrew/bin/signal-cli
+
+monitor:
+  enabled: true
+  r_factory_artifacts_dir: /Users/acess/projects/R-factory/artifacts
+  r_factory_data_dir: /Users/acess/projects/R-factory/data
+  broker_id: ibkr-futures
