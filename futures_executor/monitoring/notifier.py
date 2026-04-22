@@ -9,6 +9,15 @@ from futures_executor.config.loader import SignalSettings
 
 logger = logging.getLogger(__name__)
 
+# Alert emoji prefixes — visible on mobile lock-screen previews and
+# distinguishable without color support in signal-cli.
+EMOJI_SUCCESS = "✅"
+EMOJI_INFO = "ℹ️"
+EMOJI_WARNING = "⚠️"
+EMOJI_ERROR = "🔴"
+EMOJI_CRITICAL = "🚨"
+EMOJI_ROLL = "🔄"
+
 
 class SignalNotifier:
     """Send notifications via signal-cli."""
@@ -72,7 +81,16 @@ class SignalNotifier:
     ) -> str:
         """Build FXE-style rich summary for Signal/logging."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        lines = [f"Futures Executor — {now}", ""]
+        # Severity: errors > rolls > orders > flat.
+        if n_errors > 0:
+            emoji = EMOJI_ERROR
+        elif n_rolls > 0:
+            emoji = EMOJI_ROLL
+        elif n_orders > 0:
+            emoji = EMOJI_SUCCESS
+        else:
+            emoji = EMOJI_INFO
+        lines = [f"{emoji} Futures Executor — {now}", ""]
 
         # Target signals
         lines.append("Targets:")
@@ -146,7 +164,7 @@ class SignalNotifier:
     ) -> bool:
         """Send roll notification."""
         msg = (
-            f"ROLL: {symbol}\n"
+            f"{EMOJI_ROLL} ROLL: {symbol}\n"
             f"{from_month} -> {to_month}\n"
             f"Qty: {quantity}, Status: {status}"
         )
@@ -154,9 +172,9 @@ class SignalNotifier:
 
     def notify_error(self, symbol: str, error: str) -> bool:
         """Send error alert."""
-        msg = f"ERROR: {symbol}\n{error}"
+        msg = f"{EMOJI_ERROR} ERROR: {symbol}\n{error}"
         return self.send(msg)
 
     def notify_kill_switch(self) -> bool:
         """Send kill switch activation alert."""
-        return self.send("KILL SWITCH ACTIVATED — executor halted")
+        return self.send(f"{EMOJI_CRITICAL} KILL SWITCH ACTIVATED — executor halted")
