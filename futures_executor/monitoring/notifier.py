@@ -78,6 +78,7 @@ class SignalNotifier:
         n_errors: int,
         total_commission: float,
         positions: dict[str, int],
+        account_currency: str = "EUR",
     ) -> str:
         """Build FXE-style rich summary for Signal/logging."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -143,8 +144,11 @@ class SignalNotifier:
         lines.append("")
 
         # Account
-        lines.append(f"Equity: ${equity:,.0f}")
-        lines.append(f"Commission: ${total_commission:.2f}")
+        # Equity is in account currency (EUR for our EUR-base IBKR account).
+        # Commission is in contract currency (USD for CME/NYMEX/COMEX futures,
+        # which is all we trade); IBKR reports it raw and we don't convert.
+        lines.append(f"Equity: {equity:,.0f} {account_currency}")
+        lines.append(f"Commission: ${total_commission:.2f} USD")
         lines.append("")
 
         # Final positions

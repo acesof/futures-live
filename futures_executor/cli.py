@@ -279,6 +279,7 @@ def cmd_run_once(args):
             n_orders=n_orders, n_rolls=n_rolls, n_errors=n_errors,
             total_commission=total_commission,
             positions=pos_map,
+            account_currency=account.currency or "EUR",
         )
         print(summary)
         notifier.send(summary)
