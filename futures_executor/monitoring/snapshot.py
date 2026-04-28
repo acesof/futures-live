@@ -202,7 +202,7 @@ def _fills_and_transactions_from_audit(
 
     fills = [_row_to_fill(r, close_prices, usd_to_account, exec_to_portfolio, multiplier_map)
              for r in today_rows if _is_real_execution(r)]
-    transactions = [_row_to_transaction(r, exec_to_portfolio)
+    transactions = [_row_to_transaction(r, usd_to_account, exec_to_portfolio)
                     for r in window_rows if _is_real_execution(r)]
     return fills, transactions
 
@@ -262,6 +262,7 @@ def _row_to_fill(
 
 def _row_to_transaction(
     row: sqlite3.Row,
+    usd_to_account: float,
     exec_to_portfolio: dict[str, str],
 ) -> TransactionSnap:
     exec_sym = row["symbol"] or ""
@@ -271,7 +272,10 @@ def _row_to_transaction(
     commission = float(row["commission"] or 0.0)
     # IBKR reports commission as a positive number (amount charged). Monitor
     # convention: negative = paid. Flip sign here so forex + futures agree.
-    commission_signed = -abs(commission) if commission else 0.0
+    # IBKR commission is denominated in USD on this account; FX-convert to
+    # account currency for consistency with slippage_amount in _row_to_fill
+    # (the dashboard's COSTS section sums these in account currency, not USD).
+    commission_signed = -abs(commission) * usd_to_account if commission else 0.0
     ts = row["timestamp"] or ""
     ts_ms = _iso_to_ms(ts)
     return TransactionSnap(
