@@ -43,10 +43,26 @@ class ExecutionSettings(BaseModel):
 
 
 class VolTargetSettings(BaseModel):
+    """Per-sleeve vol targeting configuration (matches R-factory's
+    PortfolioConfig fields after the 2026-04 leverage-knob refactor).
+
+    Pre-refactor vocabulary (``target_vol`` + ``max_leverage``) was renamed
+    to align with forex-live's settings shape:
+        OLD: min(target_vol / realized_vol, max_leverage) × portfolio_leverage
+        NEW: target_sleeve_vol / max(realized_vol, vol_floor)
+
+    Mapping (preserves NON-CAP-ENGAGED region bit-for-bit):
+        target_sleeve_vol = old_target_vol × old_portfolio_leverage
+        vol_floor         = target_sleeve_vol / old_max_leverage
+
+    In the cap-engaged region the effective cap drops by old_portfolio_leverage
+    (e.g. 15→10 for futures, 50→10 for forex). The cap rarely engages for
+    typical futures realized vols (0.15-0.30); see settings.yaml comment.
+    """
     enabled: bool = True
-    target_vol: float = 0.10
+    target_sleeve_vol: float = 0.10  # was target_vol
     vol_window: int = 60
-    max_leverage: float = 3.0
+    vol_floor: float = 0.0           # was max_leverage; default 0 = no cap
     instrument_level: bool = True  # V2: vol-target per instrument (not per strategy)
 
 

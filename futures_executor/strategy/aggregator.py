@@ -87,11 +87,15 @@ def _aggregate_v1(
             returns_1d = aggregate_returns(returns_2d)
 
             if vt.enabled:
+                # R-factory's vol_target_scale keeps the kwarg name `target_vol`
+                # but accepts `vol_floor` as the new sleeve-cap mechanism. Pass
+                # our `target_sleeve_vol` value AS that kwarg (same convention
+                # forex-live uses post-refactor).
                 scale_series = vol_target_scale(
                     returns_1d,
-                    target_vol=vt.target_vol,
+                    target_vol=vt.target_sleeve_vol,
                     vol_window=vt.vol_window,
-                    max_leverage=vt.max_leverage,
+                    vol_floor=vt.vol_floor,
                 )
                 last_scale = float(scale_series[-1])
             else:
@@ -208,7 +212,12 @@ def _aggregate_v2(
         vol_series = rolling_volatility(inst_returns, window=vt.vol_window)
 
         if len(vol_series) >= 2 and not np.isnan(vol_series[-2]) and vol_series[-2] > 1e-10:
-            vol_scale = min(vt.target_vol / vol_series[-2], vt.max_leverage)
+            # Post-refactor formula: target / max(vol, floor) — math-identical
+            # to the old min(target/vol, max_leverage) when vol_floor =
+            # target_sleeve_vol / max_leverage. vol_floor=0 disables the cap
+            # (per forex-live convention).
+            denom = max(vol_series[-2], vt.vol_floor) if vt.vol_floor > 0 else vol_series[-2]
+            vol_scale = vt.target_sleeve_vol / denom
         else:
             vol_scale = 1.0
 

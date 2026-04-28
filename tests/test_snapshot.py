@@ -82,8 +82,8 @@ def _make_config(tmp_path: Path) -> SimpleNamespace:
             abs_threshold=1,
         ),
         vol_target=SimpleNamespace(
-            enabled=True, target_vol=0.30, vol_window=60,
-            max_leverage=3.0, instrument_level=True,
+            enabled=True, target_sleeve_vol=0.30, vol_window=60,
+            vol_floor=0.10, instrument_level=True,
         ),
         instruments=[
             SimpleNamespace(symbol="MES", portfolio_symbol="ES",

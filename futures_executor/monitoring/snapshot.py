@@ -487,11 +487,15 @@ def build_snapshot(
     tracking_since_ms = _iso_to_ms(tracking_since_iso)
 
     # Vol-target block (sub-dict carried on the operational fingerprint).
+    # Post-leverage-refactor vocabulary; R-factory's
+    # `replay_params_from_snapshot` accepts both this and the pre-refactor
+    # form (back-compat layer in capture.py:34) so cross-repo migration
+    # order doesn't matter.
     vol_target_dict = {
         "enabled": bool(config.vol_target.enabled),
-        "target_vol": float(config.vol_target.target_vol),
+        "target_sleeve_vol": float(config.vol_target.target_sleeve_vol),
         "vol_window": int(config.vol_target.vol_window),
-        "max_leverage": float(config.vol_target.max_leverage),
+        "vol_floor": float(config.vol_target.vol_floor),
         "instrument_level": bool(config.vol_target.instrument_level),
     }
 
