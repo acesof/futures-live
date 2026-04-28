@@ -13,23 +13,26 @@
 #   1.  Prompts: expected IBKR account ID + expected initial equity (account
 #       currency). Recommend the user has switched account in TWS BEFORE running
 #       this script — or confirm they want to use the currently-logged-in account.
-#   2.  Verify broker: connect via ib_insync, fetch accountSummary; assert
-#       account ID matches; print equity + open positions (warns about leftover
-#       paper-account cruft like warrants).
-#   3.  Optional flatten of leftover non-trading-set positions (--flatten-others;
-#       default OFF — user typically prefers manual review via TWS).
-#   4.  PAUSE — confirm before destructive steps.
-#   5.  Wipe audit.db (unless --keep-audit).
-#   6.  monitor reset --instrument-set futures_mini.
-#   7.  futures-executor run-once (first live cycle; first writes to fresh audit.db).
-#   8.  futures-executor snapshot.
-#   9.  monitor run (stamps anchor equity + new operational fingerprint).
+#   2.  Verify broker: connect via the executor's BrokerConnection class
+#       (same proven code path the daily cron uses); assert account ID
+#       matches; print equity + configured-instrument positions.
+#   3.  PAUSE — confirm before destructive steps.
+#   4.  Wipe audit.db (unless --keep-audit).
+#   5.  monitor reset --instrument-set futures_mini.
+#   6.  futures-executor run-once (first live cycle; first writes to fresh audit.db).
+#   7.  futures-executor snapshot.
+#   8.  monitor run (stamps anchor equity + new operational fingerprint).
+#
+# Note: leftover paper-account warrants / expired contracts are NOT touched
+# by this script. They don't affect futures-executor's run-once (it only
+# trades configured instruments). Clean up via TWS manually if they
+# clutter the dashboard.
 #
 # Refuses to run if monitor.db already has > 1 captured run unless --force.
 # Writes a full transcript to logs/onboard_<timestamp>.log.
 #
 # Usage:
-#   scripts/onboard_account.sh [--keep-audit] [--force] [--flatten-others]
+#   scripts/onboard_account.sh [--keep-audit] [--force]
 
 set -euo pipefail
 
@@ -42,14 +45,12 @@ IB_PORT="4002"      # paper account (4001 = live)
 
 KEEP_AUDIT="false"
 FORCE="false"
-FLATTEN_OTHERS="false"
 
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --keep-audit)       KEEP_AUDIT="true";       shift ;;
         --force)            FORCE="true";            shift ;;
-        --flatten-others)   FLATTEN_OTHERS="true";   shift ;;
         -h|--help)
             grep '^#' "$0" | sed 's/^# \?//'
             exit 0 ;;
@@ -68,7 +69,7 @@ phase() { echo; echo "=== [$1] $2 ==="; }
 fail() { echo "[$(ts)] ERROR: $*" >&2; exit 2; }
 
 echo "[$(ts)] onboard_account.sh starting (log: $LOG_FILE)"
-echo "       --keep-audit=$KEEP_AUDIT --force=$FORCE --flatten-others=$FLATTEN_OTHERS"
+echo "       --keep-audit=$KEEP_AUDIT --force=$FORCE"
 
 # Conda activate (matches run_daily.sh / monitor_cycle.sh pattern). Both
 # futures-executor + R-factory's CLI rely on this Python environment.
@@ -116,49 +117,51 @@ case "$EXPECTED_EQUITY" in
 esac
 
 # --- Phase 2: verify broker connection (read-only) ---
+# Uses the executor's proven BrokerConnection class — same code path the
+# daily cron has been running on every weekday without issue. Keeps the
+# script's IBKR contact identical in shape to what the cron does (no
+# custom ib_insync heredoc, no rapid reconnect).
 phase 2 "verify IB Gateway connection — fetch accountId + positions"
 
 PROBE_OUT="$(mktemp -t onboard_ib_probe)"
-python - "$IB_HOST" "$IB_PORT" "$EXPECTED_ACCOUNT" > "$PROBE_OUT" <<'PY'
-"""Connect via ib_insync, fetch account summary + positions, dump to JSON."""
+python - "$FUTURES_LIVE_DIR" "$EXPECTED_ACCOUNT" > "$PROBE_OUT" <<'PY'
+"""Verify connect via the executor's BrokerConnection (proven path)."""
 import json
 import sys
-from ib_insync import IB
+from pathlib import Path
 
-host, port, expected_account = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+futures_live_dir = Path(sys.argv[1])
+expected_account = sys.argv[2]
 
-ib = IB()
-# clientId=1099: distinct from futures-executor's daily cron (101) and
-# forex-live's IBKR data feed (102). Avoids the 0/1 default range where
-# IBKR sample apps + third-party tools collide.
-ib.connect(host, port, clientId=1099, timeout=15)
+from futures_executor.config.loader import load_settings
+from futures_executor.execution.broker import BrokerConnection
+
+cfg = load_settings(futures_live_dir / "futures_executor" / "config")
+broker = BrokerConnection(cfg.broker)
+broker.connect()
 try:
-    summary = {row.account: row for row in ib.accountSummary()}  # one entry per account
-    accounts = ib.managedAccounts()
-    positions = ib.positions()
+    accounts = list(broker.ib.managedAccounts())
+    account = broker.get_account_info()
+    positions = broker.get_positions()
     out = {
-        "managedAccounts": list(accounts),
+        "managedAccounts": accounts,
         "matched_expected": expected_account in accounts,
-        "positions": [
+        "equity_account_currency": float(account.equity),
+        "currency": account.currency,
+        "positions_raw": [
             {
-                "account": p.account,
-                "symbol": p.contract.symbol,
-                "secType": p.contract.secType,
-                "localSymbol": getattr(p.contract, "localSymbol", ""),
+                "symbol": p.symbol,
+                "localSymbol": p.local_symbol,
+                "exchange": p.exchange,
                 "position": float(p.position),
-                "avgCost": float(p.avgCost),
+                "avgCost": float(p.avg_cost),
             }
             for p in positions
         ],
-        "equity_account_currency": (
-            # NetLiquidation is the equity in account currency.
-            float(next(t for t in ib.accountSummary() if t.tag == "NetLiquidation").value)
-            if any(t.tag == "NetLiquidation" for t in ib.accountSummary()) else None
-        ),
     }
     print(json.dumps(out, indent=2))
 finally:
-    ib.disconnect()
+    broker.disconnect()
 PY
 
 cat "$PROBE_OUT"
@@ -173,56 +176,20 @@ fi
 echo "  account match: $EXPECTED_ACCOUNT  ✓"
 echo "  equity:        $ACTUAL_EQUITY  (expected ~$EXPECTED_EQUITY)"
 
-# --- Phase 2b: surface non-trading-set positions (warrants etc.) ---
-TRADED_SYMBOLS=$(grep -A 1 "^  - symbol:" "$FUTURES_LIVE_DIR/futures_executor/config/settings.yaml" | grep "symbol:" | awk '{print $3}' | tr '\n' '|' | sed 's/|$//')
-EXTRAS_JSON=$(jq --arg traded "$TRADED_SYMBOLS" '.positions | map(select((.secType != "FUT") or (.symbol | inside($traded) | not)))' "$PROBE_OUT" 2>/dev/null || echo "[]")
-N_EXTRAS=$(echo "$EXTRAS_JSON" | jq 'length')
-if [ "$N_EXTRAS" != "0" ]; then
-    echo
-    echo "  ⚠ Found $N_EXTRAS non-trading-set position(s) (paper-account leftovers):"
-    echo "$EXTRAS_JSON" | jq -r '.[] | "    \(.localSymbol) (\(.secType))  position=\(.position)  avgCost=\(.avgCost)"'
-fi
-
-# --- Phase 3: optional flatten of non-trading-set positions ---
-if [ "$FLATTEN_OTHERS" = "true" ] && [ "$N_EXTRAS" != "0" ]; then
-    phase 3 "attempt to flatten $N_EXTRAS non-trading-set position(s)"
-    python - "$IB_HOST" "$IB_PORT" "$EXTRAS_JSON" <<'PY'
-import json, sys
-from ib_insync import IB, MarketOrder
-host, port, extras_json = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-extras = json.loads(extras_json)
-ib = IB()
-ib.connect(host, port, clientId=1099, timeout=15)
-try:
-    # Find the actual contract objects from current positions for safe flatten.
-    pos_by_local = {p.contract.localSymbol: p for p in ib.positions()}
-    for e in extras:
-        local = e.get("localSymbol")
-        p = pos_by_local.get(local)
-        if p is None:
-            print(f"  skip {local}: not in current positions list (already gone?)")
-            continue
-        side = "SELL" if p.position > 0 else "BUY"
-        qty = abs(p.position)
-        # Some warrants can't be flattened on paper accounts (no liquidity / closed);
-        # try and report failures inline.
-        try:
-            order = MarketOrder(side, qty)
-            trade = ib.placeOrder(p.contract, order)
-            ib.sleep(2)
-            status = trade.orderStatus.status
-            print(f"  flatten {local}: {side} {qty} → {status}")
-        except Exception as exc:
-            print(f"  flatten {local}: FAILED ({exc})")
-finally:
-    ib.disconnect()
-PY
-elif [ "$FLATTEN_OTHERS" = "true" ]; then
-    echo "  --flatten-others passed but no non-trading-set positions present; nothing to do."
-fi
+# Surface non-trading-set positions (warrants etc.) for manual review via TWS.
+# BrokerConnection.get_positions() filters to instruments configured in
+# settings.yaml (i.e. the trading set). The full ib.positions() list we'd
+# need to see warrants is NOT used here — keeping the script's connect
+# pattern identical to the daily cron's. If you need to clean up the
+# paper-account warrants, do so manually via TWS.
+echo
+echo "  Note: this probe shows configured-instrument positions only. Any"
+echo "  paper-account leftovers (warrants, expired contracts, etc.) are"
+echo "  ignored here and won't affect the futures-executor run-once. Clean"
+echo "  up via TWS manually if they bother you on the dashboard."
 
 # --- Phase 4: confirmation pause ---
-phase 4 "confirm before destructive steps"
+phase 3 "confirm before destructive steps"
 
 cat <<EOF
   About to perform IRREVERSIBLE state changes:
@@ -236,7 +203,7 @@ read -rp "  Type 'yes' to proceed: " CONFIRM
 [ "$CONFIRM" != "yes" ] && { echo "[$(ts)] aborted by user before destructive phase"; exit 0; }
 
 # --- Phase 5: wipe audit.db ---
-phase 5 "audit.db handling"
+phase 4 "audit.db handling"
 
 # settings.yaml says `data/audit.db` (relative to project root)
 AUDIT_DB="$FUTURES_LIVE_DIR/data/audit.db"
@@ -258,13 +225,13 @@ else
 fi
 
 # --- Phase 6: monitor reset ---
-phase 6 "monitor reset"
+phase 5 "monitor reset"
 
 cd "$R_FACTORY_DIR"
 python -m algo_research_factory.cli monitor reset --instrument-set "$INSTRUMENT_SET"
 
 # --- Phase 7: first cycle ---
-phase 7 "first 'futures-executor run-once'"
+phase 6 "first 'futures-executor run-once'"
 
 # Re-verify IB Gateway is still reachable AFTER the user's confirmation pause
 # (parallel to forex onboard's bridge re-check). Gateway sometimes drops on
@@ -277,12 +244,12 @@ cd "$FUTURES_LIVE_DIR"
 futures-executor run-once
 
 # --- Phase 8: snapshot ---
-phase 8 "futures-executor snapshot"
+phase 7 "futures-executor snapshot"
 
 futures-executor snapshot --instrument-set "$INSTRUMENT_SET"
 
 # --- Phase 9: monitor run (anchor) ---
-phase 9 "monitor run — stamp anchor equity + new operational fingerprint"
+phase 8 "monitor run — stamp anchor equity + new operational fingerprint"
 
 cd "$R_FACTORY_DIR"
 python -m algo_research_factory.cli monitor run --instrument-set "$INSTRUMENT_SET"
