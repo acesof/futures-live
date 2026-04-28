@@ -128,8 +128,10 @@ from ib_insync import IB
 host, port, expected_account = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
 ib = IB()
-# clientId=99 to avoid colliding with the daily executor's clientId=1.
-ib.connect(host, port, clientId=99, timeout=15)
+# clientId=1099: distinct from futures-executor's daily cron (101) and
+# forex-live's IBKR data feed (102). Avoids the 0/1 default range where
+# IBKR sample apps + third-party tools collide.
+ib.connect(host, port, clientId=1099, timeout=15)
 try:
     summary = {row.account: row for row in ib.accountSummary()}  # one entry per account
     accounts = ib.managedAccounts()
@@ -190,7 +192,7 @@ from ib_insync import IB, MarketOrder
 host, port, extras_json = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 extras = json.loads(extras_json)
 ib = IB()
-ib.connect(host, port, clientId=99, timeout=15)
+ib.connect(host, port, clientId=1099, timeout=15)
 try:
     # Find the actual contract objects from current positions for safe flatten.
     pos_by_local = {p.contract.localSymbol: p for p in ib.positions()}

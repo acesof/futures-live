@@ -1,7 +1,11 @@
 broker:
   host: 127.0.0.1
   port: 4002
-  client_id: 1
+  # 101 = futures-executor's daily cron. Avoids the 0/1 default range that
+  # IBKR sample apps + many third-party tools collide on. forex-live's IBKR
+  # data feed uses 102; onboard_account.sh probes use 1099 — distinct from
+  # both. Pick a different value here only if you also rebase the others.
+  client_id: 101
   readonly: false
   timeout: 30
 
