@@ -173,24 +173,31 @@ def cmd_run_once(args):
             continuous, contract_pairs, config, exec_to_portfolio,
         )
 
-        # Compute aggregate target signals (keyed by portfolio symbol)
-        portfolio_targets, is_v2 = compute_aggregate_targets(
+        # Compute aggregate target signals (keyed by portfolio symbol).
+        # Phase 1 attribution: also captures per-strategy contributions so
+        # `fxf snapshot` can stamp them into Snapshot.per_strategy_targets.
+        portfolio_targets, is_v2, per_strategy_targets = compute_aggregate_targets(
             market_data,
             strategies_config.strategies,
             config,
         )
 
-        # Persist portfolio-symbol targets + close prices alongside audit.db
-        # so `fxf snapshot` can attach exactly what this cycle asked for
-        # (pre-lot-rounding) and compute broker-side effective_fraction /
-        # slippage_amount without needing another IBKR round-trip.
+        # Persist portfolio-symbol targets + per-strategy contributions +
+        # close prices alongside audit.db so `fxf snapshot` can attach
+        # exactly what this cycle asked for (pre-lot-rounding) and compute
+        # broker-side effective_fraction / slippage_amount without needing
+        # another IBKR round-trip.
         try:
             run_date = today
             audit_dir = Path(config.audit.db_path).parent
             audit_dir.mkdir(parents=True, exist_ok=True)
             with open(audit_dir / f"targets_{run_date}.json", "w") as f:
                 json.dump(
-                    {"targets": dict(portfolio_targets), "is_v2": bool(is_v2)},
+                    {
+                        "targets": dict(portfolio_targets),
+                        "is_v2": bool(is_v2),
+                        "per_strategy_targets": per_strategy_targets,
+                    },
                     f, indent=2,
                 )
             close_prices = {

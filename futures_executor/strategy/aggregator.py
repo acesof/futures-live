@@ -55,13 +55,17 @@ def _aggregate_v1(
     market_data,
     strategies: list[StrategyEntry],
     config: ExecutorConfig,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     """V1: replay strategies, vol-target scale, reconstruct per-instrument positions.
 
     Matches R-factory pipeline.py exactly:
       sized_pos[j] = Σ(w_i × vt_scale_i × pos_i[last, j]) / n_instruments
 
-    Returns sized positions (fraction of capital per instrument).
+    Returns (targets, per_strategy_targets) where:
+      - targets: sized positions (fraction of capital per instrument).
+      - per_strategy_targets: ``{strategy_name: {instrument: contribution}}``,
+        with ``contrib_i,j = w_i × scale_i × pos_i[last,j] / n_instruments``.
+        Σ_strategies contribution = aggregate target (V1 identity).
     """
     from algo_research_factory.src.kernel.pnl import aggregate_returns, compute_returns
     from algo_research_factory.src.kernel.positions import signals_to_positions
@@ -71,8 +75,8 @@ def _aggregate_v1(
     n_instruments = len(instrument_names)
     vt = config.vol_target
 
-    # Collect per-strategy: weight, last-bar scale, last-bar positions
-    strategy_data = []  # list of (weight, scale, positions_last)
+    # Collect per-strategy: name, weight, last-bar scale, last-bar positions
+    strategy_data = []  # list of (name, weight, scale, positions_last)
 
     for entry in strategies:
         if not entry.enabled:
@@ -107,7 +111,7 @@ def _aggregate_v1(
             else:
                 pos_last = np.array([positions[-1]])
 
-            strategy_data.append((entry.weight, last_scale, pos_last))
+            strategy_data.append((entry.name, entry.weight, last_scale, pos_last))
             logger.debug(
                 f"  {entry.name}: vt_scale={last_scale:.3f} "
                 f"weight={entry.weight:.4f} pos_last={pos_last}"
@@ -118,15 +122,19 @@ def _aggregate_v1(
 
     if not strategy_data:
         logger.warning("No strategies produced signals")
-        return {name: 0.0 for name in instrument_names}
+        return {name: 0.0 for name in instrument_names}, {}
 
-    # Reconstruct per-instrument sized positions
+    # Reconstruct per-instrument sized positions + per-strategy contributions.
     # sized_pos[j] = Σ(w_i × scale_i × pos_i[j]) / n_instruments
+    # contrib_i,j = w_i × scale_i × pos_i[j] / n_instruments  (Phase 1 attribution)
     sized = np.zeros(n_instruments)
-    for j in range(n_instruments):
-        for weight, scale, pos_last in strategy_data:
-            sized[j] += weight * scale * pos_last[j]
-        sized[j] /= n_instruments
+    per_strategy: dict[str, dict[str, float]] = {}
+    for name, weight, scale, pos_last in strategy_data:
+        per_strategy[name] = {}
+        for j in range(n_instruments):
+            contrib = weight * scale * pos_last[j] / n_instruments
+            per_strategy[name][instrument_names[j]] = float(contrib)
+            sized[j] += contrib
 
     targets = {}
     for i, name in enumerate(instrument_names):
@@ -136,7 +144,7 @@ def _aggregate_v1(
         f"V1 targets ({len(strategy_data)} strategies): "
         + ", ".join(f"{k}={v:+.6f}" for k, v in targets.items())
     )
-    return targets
+    return targets, per_strategy
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +155,21 @@ def _aggregate_v2(
     market_data,
     strategies: list[StrategyEntry],
     config: ExecutorConfig,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     """V2: aggregate raw signals → instrument-level vol target → sized positions.
 
     Output is sized_j: a fraction of capital that already includes
     the risk budget B_j = 1/n_instruments. The executor should NOT
     divide by n_instruments again when sizing contracts/lots.
+
+    Returns (targets, per_strategy_targets). Per-strategy attribution
+    uses share-of-the-numerator at active strategies:
+
+        share_i,j = (w_i × pos_i,j × active_i,j) / Σ_k (w_k × pos_k,j × active_k,j)
+        contrib_i,j = share_i,j × sized_j
+
+    Σ_i contrib_i,j == sized_j when ≥1 active strategy in j; else both 0.
+    Inactive strategies contribute exactly 0.
     """
     from algo_research_factory.src.portfolio.vol_target import rolling_volatility
 
@@ -162,7 +179,7 @@ def _aggregate_v2(
     epsilon = 1e-8
 
     # Step 1: Collect last-bar raw signals from each strategy
-    strategy_signals = []  # list of (weight, signals_array)
+    strategy_signals = []  # list of (name, weight, signals_array)
     for entry in strategies:
         if not entry.enabled:
             continue
@@ -170,7 +187,7 @@ def _aggregate_v2(
             module = _import_strategy(entry)
             output = module.generate_signals(market_data, entry.params)
             signals = np.clip(output.target_position[-1], -1.0, 1.0)
-            strategy_signals.append((entry.weight, signals))
+            strategy_signals.append((entry.name, entry.weight, signals))
             logger.debug(f"  {entry.name}: weight={entry.weight:.4f} signals={signals}")
         except Exception as e:
             logger.error(f"Strategy {entry.name} failed: {e}")
@@ -178,19 +195,26 @@ def _aggregate_v2(
 
     if not strategy_signals:
         logger.warning("No strategies produced signals")
-        return {name: 0.0 for name in instrument_names}
+        return {name: 0.0 for name in instrument_names}, {}
 
     # Step 2: Aggregate per instrument with active-weight normalization
     # s_j = Σ(w_i × σ_{i,j}) / Σ(w_i for active_j)
     # where active = |σ_{i,j}| > epsilon
+    # Also stash per-(strategy, instrument) signed contribution-numerator so
+    # Phase 1 attribution downstream can split sized_j by share-of-numerator.
     agg_signals = np.zeros(n_instruments)
+    per_strat_numer: dict[str, np.ndarray] = {
+        name: np.zeros(n_instruments) for name, _, _ in strategy_signals
+    }
     for j in range(n_instruments):
         weighted_sum = 0.0
         active_weight_sum = 0.0
-        for weight, signals in strategy_signals:
+        for name, weight, signals in strategy_signals:
             sig_j = signals[j] if signals.ndim > 0 and len(signals) > j else signals
             if abs(sig_j) > epsilon:
-                weighted_sum += weight * sig_j
+                signed_numer = weight * float(sig_j)
+                per_strat_numer[name][j] = signed_numer
+                weighted_sum += signed_numer
                 active_weight_sum += weight
         if active_weight_sum > epsilon:
             agg_signals[j] = np.clip(weighted_sum / active_weight_sum, -1.0, 1.0)
@@ -232,11 +256,29 @@ def _aggregate_v2(
     for i, name in enumerate(instrument_names):
         targets[name] = float(sized[i])
 
+    # Per-strategy attribution: share-of-numerator × sized.
+    # Σ_strategies contrib_inst == sized[inst] when ≥1 active strategy in inst.
+    per_strategy_targets: dict[str, dict[str, float]] = {
+        name: {} for name in per_strat_numer
+    }
+    for j, inst in enumerate(instrument_names):
+        # Total signed numerator for this instrument (= active_denom × agg in
+        # the unclipped case). When 0, sized is 0 too — every contrib is 0.
+        total_numer = sum(arr[j] for arr in per_strat_numer.values())
+        if abs(total_numer) <= epsilon:
+            for name in per_strat_numer:
+                per_strategy_targets[name][inst] = 0.0
+            continue
+        sized_j = float(sized[j])
+        for name, arr in per_strat_numer.items():
+            share = float(arr[j]) / total_numer
+            per_strategy_targets[name][inst] = share * sized_j
+
     logger.info(
         f"V2 aggregate targets ({len(strategy_signals)} strategies): "
         + ", ".join(f"{k}={v:+.6f}" for k, v in targets.items())
     )
-    return targets
+    return targets, per_strategy_targets
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +288,14 @@ def _aggregate_v2(
 def _apply_gross_cap(
     targets: dict[str, float],
     cap: float,
-) -> dict[str, float]:
-    """Proportionally scale all positions if gross exposure exceeds cap."""
+) -> tuple[dict[str, float], float]:
+    """Proportionally scale all positions if gross exposure exceeds cap.
+
+    Returns (capped_targets, scale_factor) — scale_factor is 1.0 when the
+    cap doesn't engage. Caller (compute_aggregate_targets) multiplies
+    per_strategy contributions by the same factor so the identity
+    Σ_strategies contrib == post-cap target stays consistent.
+    """
     gross = sum(abs(v) for v in targets.values())
     if gross > cap:
         scale = cap / gross
@@ -255,37 +303,45 @@ def _apply_gross_cap(
             f"Gross exposure {gross:.4f} exceeds cap {cap:.4f}, "
             f"scaling all positions by {scale:.4f}"
         )
-        return {k: v * scale for k, v in targets.items()}
-    return targets
+        return {k: v * scale for k, v in targets.items()}, scale
+    return targets, 1.0
 
 
 def compute_aggregate_targets(
     market_data,
     strategies: list[StrategyEntry],
     config: ExecutorConfig,
-) -> tuple[dict[str, float], bool]:
+) -> tuple[dict[str, float], bool, dict[str, dict[str, float]]]:
     """Compute per-instrument target positions.
 
-    Returns (targets_dict, is_v2) where:
+    Returns (targets_dict, is_v2, per_strategy_targets) where:
       - Both V1 and V2 targets are sized exposure fractions.
       - V1: reconstructed from per-strategy vol-scaled positions / n_instruments
       - V2: instrument-level vol targeting with risk budget B_j embedded
       - is_v2: True if V2 was used
+      - per_strategy_targets: ``{strategy_name: {instrument: contribution}}``
+        such that Σ_strategies contrib == targets[inst]. Empty dict when
+        no strategies survived loading.
     """
     is_v2 = config.vol_target.instrument_level
 
     if is_v2:
-        targets = _aggregate_v2(market_data, strategies, config)
+        targets, per_strategy = _aggregate_v2(market_data, strategies, config)
     else:
-        targets = _aggregate_v1(market_data, strategies, config)
+        targets, per_strategy = _aggregate_v1(market_data, strategies, config)
 
-    # Apply gross exposure cap (proportional scale-down)
+    # Apply gross exposure cap (proportional scale-down). Scale per-strategy
+    # contributions by the same factor so the identity holds post-cap.
     cap = config.execution.gross_exposure_cap
     if cap is not None:
-        targets = _apply_gross_cap(targets, cap)
+        targets, scale = _apply_gross_cap(targets, cap)
+        if scale != 1.0:
+            for name in per_strategy:
+                for inst in per_strategy[name]:
+                    per_strategy[name][inst] *= scale
 
     logger.info(
         f"{'V2' if is_v2 else 'V1'} targets: "
         + ", ".join(f"{k}={v:+.4f}" for k, v in targets.items())
     )
-    return targets, is_v2
+    return targets, is_v2, per_strategy

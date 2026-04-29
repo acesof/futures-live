@@ -326,14 +326,26 @@ def _iso_to_ms(iso: str) -> int:
 # Targets + close prices (persisted by cmd_run_once)
 # ---------------------------------------------------------------------------
 
-def _load_targets(audit_db_path: Path, run_date: str) -> tuple[dict[str, float], bool]:
+def _load_targets(
+    audit_db_path: Path, run_date: str,
+) -> tuple[dict[str, float], bool, dict[str, dict[str, float]]]:
+    """Load targets_<date>.json. Phase 1: also returns per_strategy_targets.
+
+    Old-format files (without ``per_strategy_targets``) deserialize to
+    empty dict — safe for the cross-update window between executor and
+    snapshot writer.
+    """
     path = audit_db_path.parent / f"targets_{run_date}.json"
     if not path.exists():
         logger.warning(f"targets snapshot not found: {path}")
-        return {}, False
+        return {}, False, {}
     with open(path) as f:
         data = json.load(f)
-    return dict(data.get("targets", {})), bool(data.get("is_v2", False))
+    return (
+        dict(data.get("targets", {})),
+        bool(data.get("is_v2", False)),
+        dict(data.get("per_strategy_targets", {})),
+    )
 
 
 def _load_close_prices(audit_db_path: Path, run_date: str) -> dict[str, float]:
@@ -491,7 +503,9 @@ def build_snapshot(
 
     # is_v2 is a stable config property — decoupled from the optional
     # targets file (absent on pre-executor-run snapshots).
-    targets, _ = _load_targets(Path(config.audit.db_path), run_date)
+    targets, _, per_strategy_targets = _load_targets(
+        Path(config.audit.db_path), run_date,
+    )
     is_v2 = bool(config.vol_target.instrument_level)
 
     if strategies_yaml_path is None:
@@ -546,6 +560,7 @@ def build_snapshot(
         dynamic_lot_sizing=True,              # futures always size from equity + price
         min_delta_lots=float(config.execution.abs_threshold),  # in contracts
         vol_target=vol_target_dict,
+        per_strategy_targets=per_strategy_targets,
     )
 
 
