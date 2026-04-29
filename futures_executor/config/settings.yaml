@@ -45,26 +45,17 @@ execution:
   margin_cap: 0.8        # max fraction of equity usable for initial margin
   order_type: market
 
-# Vol-targeting — post-leverage-refactor vocabulary (matches forex-live's
-# settings.yaml::vol_target shape and R-factory's PortfolioConfig fields).
-#
-#   OLD: min(target_vol=0.30 / realized_vol, max_leverage=10) × portfolio_leverage=1.5
-#   NEW: target_sleeve_vol=0.45 / max(realized_vol, vol_floor=0.045)
-#
-# In the NON-CAP-ENGAGED region (realized_vol > vol_floor), bit-for-bit
-# identical (both formulas reduce to 0.45/realized_vol).
-#
-# In the CAP-ENGAGED region (realized_vol < vol_floor), the effective cap
-# changes from old_max_leverage × old_portfolio_leverage = 15 to
-# target_sleeve_vol / vol_floor = 10. This is the same 1.5× reduction
-# forex-live's refactor produced (cap went from 50 to 10 there); kept for
-# cross-repo consistency. ES/CL/GC realized vol is typically 0.15-0.30 so
-# the cap rarely engages anyway.
+# Vol-targeting — aligned with the R-factory build that produced the
+# currently-deployed strategies.yaml (knobs: target_sleeve_vol=0.4,
+# vol_floor=0.03, gross_exposure_cap=5.0). Per-sleeve cap = 0.4/0.03 ≈ 13.3.
+# When R-factory's build is re-run with different knobs and re-exported,
+# update these values to match so live execution matches the regime under
+# which strategies were selected and weights computed.
 vol_target:
   enabled: true
-  target_sleeve_vol: 0.45
+  target_sleeve_vol: 0.4
   vol_window: 60
-  vol_floor: 0.045
+  vol_floor: 0.03
   instrument_level: false  # V1: per-strategy vol targeting
 
 data:
