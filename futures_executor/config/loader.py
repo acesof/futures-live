@@ -78,6 +78,16 @@ class SafetySettings(BaseModel):
     max_daily_turnover: int = 20
     kill_switch_file: str = ".kill_switch"
     heartbeat_timeout: int = 300
+    # Capital controls v1: daily-loss circuit breaker. Set strictly below
+    # worst historical day on this instrument set so it fires only on
+    # outcomes outside our entire backtest envelope. ≤0 disables.
+    # See R-factory PLAN_CAPITAL_CONTROLS_V1.md for calibration rationale.
+    # Note: futures_mini xray hasn't been generated yet — 5.0 is a
+    # placeholder; recalibrate before futures real-money launch.
+    daily_loss_circuit_pct: float = 5.0
+    # Persisted today's start-of-day equity. Seeded on the first cycle
+    # of each UTC date.
+    reference_equity_file: str = "data/reference_equity.json"
 
 
 class AuditSettings(BaseModel):

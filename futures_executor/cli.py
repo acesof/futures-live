@@ -39,12 +39,14 @@ def _save_state(state: dict):
 
 
 def _check_kill_switch(config) -> bool:
-    """Check if kill switch file exists."""
-    path = Path(config.safety.kill_switch_file)
-    if path.exists():
-        logger.critical(f"Kill switch active: {path}")
-        return True
-    return False
+    """Check if kill switch file exists.
+
+    Thin wrapper around `execution.safety.check_kill_switch` — kept here
+    so existing call sites in this file don't churn. New code should
+    call the safety module directly.
+    """
+    from futures_executor.execution.safety import check_kill_switch
+    return check_kill_switch(config)
 
 
 def cmd_run_once(args):
@@ -100,6 +102,21 @@ def cmd_run_once(args):
         if account.equity <= 0:
             logger.critical("Account equity is zero or negative")
             return 1
+
+        # Daily-loss circuit breaker (capital controls v1).
+        # Trip semantics: first cycle of each UTC date seeds reference_equity;
+        # subsequent cycles trip if loss > threshold and auto-flip the kill
+        # switch. Sticky — manual reset required.
+        try:
+            from futures_executor.execution.safety import check_daily_loss_circuit
+            circuit = check_daily_loss_circuit(config, float(account.equity))
+            if circuit.should_trip:
+                logger.error(f"🚨 Daily-loss circuit tripped — {circuit.reason}")
+                notifier.notify_error("CIRCUIT", circuit.reason)
+                return 1
+        except Exception as e:
+            # Don't let circuit-breaker check itself crash the cycle.
+            logger.warning(f"Daily-loss circuit check failed (non-fatal): {e}")
 
         # Resolve contracts
         resolver = ContractResolver(broker.ib, config.roll)

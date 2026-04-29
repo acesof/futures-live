@@ -78,6 +78,13 @@ safety:
   max_daily_turnover: 20
   kill_switch_file: .kill_switch
   heartbeat_timeout: 300
+  # Capital controls v1: trip the kill switch automatically if today's loss
+  # exceeds this %. forex_major calibration: worst historical day = -3.35%,
+  # 5% is the smallest threshold not seen in 21 years of sim history.
+  # futures_mini's own xray hasn't been generated yet; recalibrate before
+  # futures real-money launch. ≤0 disables.
+  daily_loss_circuit_pct: 5.0
+  reference_equity_file: data/reference_equity.json
 
 audit:
   db_path: data/audit.db
