@@ -47,8 +47,16 @@ conda activate base
 
 # 3. Monitor: replay sim against the freshly-ingested parquet, capture
 #    today's row, regenerate the dashboard.
+#
+# --balance-tol-bps 100 (= 1% of equity): TACTICAL bump. Futures balance
+# settles daily via mark-to-market on still-open positions, which is not
+# in the txn-driven Δexpected — so Δactual − Δexpected drifts by the day's
+# MTM (typically 0.05–0.5% on this portfolio). Default 1 bp would refuse
+# every day. Tighten back to default once the futures-aware reconciliation
+# (item #2 in 2026-04-29 review) ships.
 (cd "$R_FACTORY_DIR" && python -m algo_research_factory.cli monitor run \
-    --instrument-set "$INSTRUMENT_SET") 2>&1 | tee -a "$LOG_FILE"
+    --instrument-set "$INSTRUMENT_SET" \
+    --balance-tol-bps 100) 2>&1 | tee -a "$LOG_FILE"
 
 # 4. Health checks → Signal on any warning/critical.
 FINDINGS_FILE="$(mktemp -t monitor_findings)"

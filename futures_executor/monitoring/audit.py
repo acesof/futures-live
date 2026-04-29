@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS executions (
     bar_close REAL,                -- last bar close for slippage calc
     slippage_ticks REAL,
     commission REAL,
+    realized_pnl REAL,             -- account-currency realized P&L on closing legs (NULL for opens / pre-migration rows)
     status TEXT,                   -- 'Filled', 'FAILED', etc.
     error TEXT,
     details TEXT                   -- JSON blob for extra info
@@ -68,7 +69,26 @@ class AuditLog:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent column-add migrations for older audit.db files.
+
+        ALTER TABLE ADD COLUMN is the SQLite-friendly path. Each addition is
+        guarded by a PRAGMA table_info check so re-running on a fresh DB
+        (where the column already exists from SCHEMA) is a no-op.
+        """
+        existing = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(executions)"
+            ).fetchall()
+        }
+        if "realized_pnl" not in existing:
+            # Pre-existing rows get NULL → snapshot reader treats NULL as 0.0
+            # for back-compat with the pre-migration "realized always zero" world.
+            self._conn.execute("ALTER TABLE executions ADD COLUMN realized_pnl REAL")
+            logger.info("audit.db: added executions.realized_pnl column")
 
     def log_execution(
         self,
@@ -83,6 +103,7 @@ class AuditLog:
         fill_price: float | None = None,
         bar_close: float | None = None,
         commission: float | None = None,
+        realized_pnl: float | None = None,
         status: str | None = None,
         error: str | None = None,
         details: dict | None = None,
@@ -99,13 +120,14 @@ class AuditLog:
             (timestamp, run_date, symbol, event_type, action, quantity,
              target_contracts, current_contracts, target_signal,
              fill_price, bar_close, slippage_ticks, commission,
-             status, error, details)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             realized_pnl, status, error, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.utcnow().isoformat(),
                 run_date, symbol, event_type, action, quantity,
                 target_contracts, current_contracts, target_signal,
                 fill_price, bar_close, slippage, commission,
+                realized_pnl,
                 status, error,
                 json.dumps(details) if details else None,
             ),

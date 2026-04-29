@@ -251,6 +251,7 @@ def cmd_run_once(args):
                 fill_price=rec.get("fill_price"),
                 bar_close=rec.get("bar_close"),
                 commission=commission,
+                realized_pnl=rec.get("realized_pnl"),
                 status=status,
                 error=rec.get("error"),
             )
@@ -436,6 +437,7 @@ def cmd_flatten(args):
                 quantity=qty,
                 fill_price=fill.avg_fill_price,
                 commission=fill.commission,
+                realized_pnl=fill.realized_pnl,
                 status=trade.orderStatus.status,
             )
             print(
@@ -583,6 +585,7 @@ def cmd_manual_roll(args):
             quantity=front_qty,
             fill_price=fill.avg_fill_price,
             commission=fill.commission,
+            realized_pnl=fill.realized_pnl,
             status=trade.orderStatus.status,
         )
         notifier.notify_roll(

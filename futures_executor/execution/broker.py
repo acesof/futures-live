@@ -54,6 +54,12 @@ class FillInfo:
     quantity: float
     avg_fill_price: float
     commission: float = 0.0
+    # Sum of realizedPNL across constituent fills, in account currency.
+    # IBKR populates `CommissionReport.realizedPNL` only on the closing leg
+    # of a position — opening trades report 0/NaN. Per ib_insync docs the
+    # value is already in account currency, no conversion needed. Sign
+    # convention: positive = profit on close, negative = loss.
+    realized_pnl: float = 0.0
 
 
 class BrokerConnection:
@@ -246,6 +252,15 @@ class BrokerConnection:
         )
         commission = sum(f.commissionReport.commission for f in fills
                         if f.commissionReport.commission) if fills else 0.0
+        # CommissionReport.realizedPNL is set only on closing fills; for opening
+        # fills IBKR returns sys.float_info.max as a sentinel for "not applicable".
+        # Filter the sentinel out so we don't sum 1.7976931348623157e+308.
+        realized_pnl = 0.0
+        if fills:
+            for f in fills:
+                pnl = f.commissionReport.realizedPNL
+                if pnl is not None and abs(pnl) < 1e30:
+                    realized_pnl += pnl
 
         return FillInfo(
             order_id=trade.order.orderId,
@@ -254,6 +269,7 @@ class BrokerConnection:
             quantity=total_qty,
             avg_fill_price=avg_price,
             commission=commission,
+            realized_pnl=realized_pnl,
         )
 
     def cancel_order(self, trade: Trade, timeout: float = 10) -> bool:

@@ -331,3 +331,96 @@ def test_write_snapshot_creates_canonical_path(tmp_path):
     assert reloaded.run_date == run_date
     assert reloaded.instrument_set == _INSTRUMENT_SET
     assert reloaded.broker_id == "ibkr-futures"
+
+
+# ----- realized_pnl migration + read coverage (2026-04-29) -----
+
+def test_audit_db_migration_adds_realized_pnl_column_idempotently(tmp_path):
+    """Pre-2026-04-29 audit.db lacks the realized_pnl column. Opening it via
+    AuditLog should add the column, populating NULL on existing rows. Re-opening
+    must be a no-op (idempotent) so daily startup doesn't churn.
+    """
+    from futures_executor.monitoring.audit import AuditLog
+    db_path = tmp_path / "old_audit.db"
+
+    # Seed an OLD-shape executions table (no realized_pnl column).
+    _seed_audit_db(db_path, "2026-04-28")
+
+    # First open: migration runs, column added.
+    AuditLog(db_path).close()
+    cols_after_first = {
+        row[1] for row in
+        sqlite3.connect(str(db_path)).execute("PRAGMA table_info(executions)").fetchall()
+    }
+    assert "realized_pnl" in cols_after_first
+
+    # Second open: SCHEMA's CREATE-IF-NOT-EXISTS skips, _migrate sees column
+    # already present and does nothing. Validates the no-op path.
+    AuditLog(db_path).close()
+
+
+def test_row_to_transaction_reads_realized_pnl_with_usd_to_account_conversion(tmp_path):
+    """Snapshot's _row_to_transaction must surface IBKR's CommissionReport.realizedPNL
+    (USD on this account) into TransactionSnap.realized_pnl_amount in account
+    currency. Today's GC partial-close is the canonical case — this is what
+    fixes monitor's balance-jump check on partial-close days.
+    """
+    from futures_executor.monitoring.audit import AuditLog
+    from futures_executor.monitoring.snapshot import _row_to_transaction
+
+    db_path = tmp_path / "audit.db"
+    audit = AuditLog(db_path)
+    audit.log_execution(
+        run_date="2026-04-28", symbol="MGC", event_type="adjustment",
+        action="SELL", quantity=1, fill_price=4680.6, bar_close=4682.6,
+        commission=0.97, realized_pnl=-1746.0, status="Filled",
+    )
+    audit.close()
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM executions").fetchone()
+
+    # USD→EUR conversion = 1 / 1.10 ≈ 0.9091
+    tx = _row_to_transaction(
+        row, usd_to_account=1 / 1.10, exec_to_portfolio={"MGC": "GC"},
+    )
+    assert tx.instrument == "GC"
+    assert tx.realized_pnl_amount == pytest.approx(-1746.0 / 1.10, rel=1e-6)
+    # Commission negated + converted (signed-as-cost convention).
+    assert tx.commission_amount == pytest.approx(-0.97 / 1.10, rel=1e-6)
+    conn.close()
+
+
+def test_row_to_transaction_handles_null_realized_pnl_pre_migration(tmp_path):
+    """Rows logged before the migration have NULL realized_pnl. Reader must
+    fall back to 0.0 (matching the old "always zero" behavior) rather than
+    crashing on the None.
+    """
+    from futures_executor.monitoring.snapshot import _row_to_transaction
+
+    # Build a row directly via raw insert simulating pre-migration state —
+    # AuditLog.__init__ runs the migration so we'd never get NULL via that
+    # path on a fresh DB. Use a hand-built sqlite3.Row instead.
+    db_path = tmp_path / "raw.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE executions (
+            id INTEGER PRIMARY KEY, timestamp TEXT, run_date TEXT, symbol TEXT,
+            event_type TEXT, action TEXT, quantity INTEGER,
+            fill_price REAL, commission REAL, realized_pnl REAL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO executions (timestamp, run_date, symbol, event_type, action, "
+        "quantity, fill_price, commission, realized_pnl) VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        ("2026-04-28T21:30:00+00:00", "2026-04-28", "MGC", "adjustment",
+         "SELL", 1, 4680.6, 0.97),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM executions").fetchone()
+    tx = _row_to_transaction(row, usd_to_account=1.0, exec_to_portfolio={"MGC": "GC"})
+    assert tx.realized_pnl_amount == 0.0
+    conn.close()

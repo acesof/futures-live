@@ -490,6 +490,7 @@ class OrderManager:
                     "action": action,
                     "quantity": qty,
                     "fill_price": fill.avg_fill_price,
+                    "realized_pnl": fill.realized_pnl,
                     "commission": fill.commission,
                     "status": trade.orderStatus.status,
                     "target_contracts": target,
@@ -592,6 +593,7 @@ class OrderManager:
                 "to_month": pair.next.expiry_str,
                 "quantity": current_qty,
                 "fill_price": fill.avg_fill_price,
+                "realized_pnl": fill.realized_pnl,
                 "commission": fill.commission,
                 "status": trade.orderStatus.status,
             }
@@ -650,6 +652,7 @@ class OrderManager:
                     "action": close_action,
                     "quantity": close_qty,
                     "fill_price": fill.avg_fill_price,
+                    "realized_pnl": fill.realized_pnl,
                     "commission": fill.commission,
                     "status": trade.orderStatus.status,
                 }
@@ -694,6 +697,7 @@ class OrderManager:
                     "action": open_action,
                     "quantity": open_qty,
                     "fill_price": fill.avg_fill_price,
+                    "realized_pnl": fill.realized_pnl,
                     "commission": fill.commission,
                     "status": trade.orderStatus.status,
                 }
@@ -738,6 +742,7 @@ class OrderManager:
                 "action": action,
                 "quantity": qty,
                 "fill_price": fill.avg_fill_price,
+                "realized_pnl": fill.realized_pnl,
                 "commission": fill.commission,
                 "status": trade.orderStatus.status,
             }, trade

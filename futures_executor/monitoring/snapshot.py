@@ -178,10 +178,15 @@ def _fills_and_transactions_from_audit(
     futures-live logs every execution with commission + slippage_ticks +
     fill_price + bar_close. We compute slippage_amount (USD) here.
 
-    Since audit.db doesn't track per-trade realized PnL, transactions
-    carry ``realized_pnl_amount=0.0``. Balance-jump check in the monitor
-    will accumulate commission only — adequate for our v1 contract
-    (monitor reset on rollover covers the one case where this matters).
+    Realized P&L per fill is captured from
+    ``CommissionReport.realizedPNL`` (closing legs only) and persisted to
+    ``executions.realized_pnl`` (column added 2026-04-29). Pre-migration
+    rows have NULL → 0.0 fallback in ``_row_to_transaction``. The monitor's
+    balance-jump check uses ``realized + commission`` per today's
+    transactions, so partial-close P&L now reconciles against Δbalance.
+    Daily MTM on still-open positions is a separate gap — handled by the
+    --balance-tol-bps flag (tactical) until the futures-aware
+    reconciliation lands.
     """
     if not Path(audit_db_path).exists():
         return [], []
@@ -276,6 +281,18 @@ def _row_to_transaction(
     # account currency for consistency with slippage_amount in _row_to_fill
     # (the dashboard's COSTS section sums these in account currency, not USD).
     commission_signed = -abs(commission) * usd_to_account if commission else 0.0
+
+    # Realized P&L: only present on closing fills. Schema added 2026-04-29
+    # (IBKR's CommissionReport.realizedPNL — see broker.get_fill_info). NULL
+    # for pre-migration rows → 0.0 fallback (matches the prior "always zero"
+    # behavior). IBKR reports realizedPNL in USD on this account; FX-convert
+    # to account currency to match the monitor's balance-jump check
+    # convention (Δbalance is in account currency).
+    realized_raw = row["realized_pnl"] if "realized_pnl" in row.keys() else None
+    realized_pnl_account = (
+        float(realized_raw) * usd_to_account if realized_raw is not None else 0.0
+    )
+
     ts = row["timestamp"] or ""
     ts_ms = _iso_to_ms(ts)
     return TransactionSnap(
@@ -286,7 +303,7 @@ def _row_to_transaction(
         open_price=fill_price,        # single-fill → open ≈ close
         close_price=fill_price,
         commission_amount=commission_signed,
-        realized_pnl_amount=0.0,      # futures-live audit doesn't track per-trade realized PnL yet
+        realized_pnl_amount=realized_pnl_account,
         open_time_ms=ts_ms,
         close_time_ms=ts_ms,
     )
