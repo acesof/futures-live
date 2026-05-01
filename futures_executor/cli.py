@@ -682,14 +682,16 @@ def cmd_snapshot(args):
         logger.critical(f"Failed to connect to IB Gateway: {e}")
         return 1
 
+    snapshot_mode = "snapshot_only" if getattr(args, "snapshot_only", False) else "full_cycle"
     try:
         snapshot = build_snapshot(
             config=config, broker=broker,
             instrument_set=args.instrument_set,
             tracking_since_iso=tracking_since_iso,
+            snapshot_mode=snapshot_mode,
         )
         path = write_snapshot(snapshot, Path(config.monitor.r_factory_artifacts_dir))
-        print(f"Snapshot written: {path}")
+        print(f"Snapshot written: {path} (mode={snapshot_mode})")
     finally:
         broker.disconnect()
     return 0
@@ -957,6 +959,17 @@ def main():
     p_snap.add_argument(
         "--instrument-set", required=True,
         help="Instrument set name (matches R-factory set; e.g. futures_mini)",
+    )
+    p_snap.add_argument(
+        "--snapshot-only", action="store_true",
+        help=(
+            "Capture without requiring same-day run-once sidecars "
+            "(targets_<date>.json + close_prices_<date>.json). Without "
+            "this, missing sidecars hard-fail because the dashboard would "
+            "treat empty targets as zero and produce false drift "
+            "criticals. Use only for ad-hoc inspection — capture-side "
+            "will skip drift comparison for instruments without targets."
+        ),
     )
     p_snap.set_defaults(func=cmd_snapshot)
 

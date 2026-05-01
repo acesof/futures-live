@@ -220,7 +220,57 @@ def test_build_snapshot_round_trips_and_computes_effective_fraction(tmp_path):
     assert restored == snap
 
 
-def test_build_snapshot_handles_missing_targets_gracefully(tmp_path):
+def test_build_snapshot_full_cycle_refuses_missing_targets(tmp_path):
+    """Phase α (2026-05-01): default snapshot_mode='full_cycle' hard-fails
+    when same-day targets sidecar is missing. Replaces the older lenient
+    behavior (returned snap.targets={}) which silently produced false-
+    positive drift criticals downstream — symmetric to forex-live's
+    enforcement."""
+    from futures_executor.monitoring.snapshot import IncompleteSnapshotError
+
+    config = _make_config(tmp_path)
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _seed_audit_db(Path(config.audit.db_path), run_date)
+    _write_close_prices(tmp_path, run_date, {})
+    _write_dataset_manifest(tmp_path, _INSTRUMENT_SET, "vtest")
+    strategies_yaml = _write_strategies_yaml(tmp_path)
+
+    with pytest.raises(IncompleteSnapshotError) as excinfo:
+        build_snapshot(
+            config=config, broker=_fake_broker(),
+            instrument_set=_INSTRUMENT_SET,
+            tracking_since_iso=_TRACK_SINCE,
+            run_date=run_date,
+            strategies_yaml_path=strategies_yaml,
+        )
+    assert "targets" in str(excinfo.value)
+
+
+def test_build_snapshot_full_cycle_refuses_missing_close_prices(tmp_path):
+    from futures_executor.monitoring.snapshot import IncompleteSnapshotError
+
+    config = _make_config(tmp_path)
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _seed_audit_db(Path(config.audit.db_path), run_date)
+    _write_targets(tmp_path, run_date, {"ES": 0.3}, is_v2=True)
+    _write_dataset_manifest(tmp_path, _INSTRUMENT_SET, "vtest")
+    strategies_yaml = _write_strategies_yaml(tmp_path)
+
+    with pytest.raises(IncompleteSnapshotError) as excinfo:
+        build_snapshot(
+            config=config, broker=_fake_broker(),
+            instrument_set=_INSTRUMENT_SET,
+            tracking_since_iso=_TRACK_SINCE,
+            run_date=run_date,
+            strategies_yaml_path=strategies_yaml,
+        )
+    assert "close_prices" in str(excinfo.value)
+
+
+def test_build_snapshot_snapshot_only_tolerates_missing_sidecars(tmp_path):
+    """The explicit ad-hoc operator path — both sidecars missing, but
+    snapshot_only mode tolerates it and stamps provenance flags so
+    capture-side knows to skip drift comparison."""
     config = _make_config(tmp_path)
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _seed_audit_db(Path(config.audit.db_path), run_date)
@@ -233,9 +283,12 @@ def test_build_snapshot_handles_missing_targets_gracefully(tmp_path):
         tracking_since_iso=_TRACK_SINCE,
         run_date=run_date,
         strategies_yaml_path=strategies_yaml,
+        snapshot_mode="snapshot_only",
     )
+    assert snap.snapshot_mode == "snapshot_only"
+    assert snap.has_targets is False
+    assert snap.has_close_prices is False
     assert snap.targets == {}
-    # is_v2 still comes from config, unaffected by missing targets file.
     assert snap.is_v2 is True
 
 
@@ -318,6 +371,7 @@ def test_write_snapshot_creates_canonical_path(tmp_path):
     run_date = "2026-05-01"
     _seed_audit_db(Path(config.audit.db_path), run_date)
     _write_targets(tmp_path, run_date, {}, is_v2=True)
+    _write_close_prices(tmp_path, run_date, {})
     _write_dataset_manifest(tmp_path, _INSTRUMENT_SET, "vtest")
     strategies_yaml = _write_strategies_yaml(tmp_path)
 

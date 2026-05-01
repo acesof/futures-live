@@ -449,6 +449,19 @@ def _usd_to_account_factor(account_currency: str, eurusd_spot: float) -> float:
 # Main builder
 # ---------------------------------------------------------------------------
 
+class IncompleteSnapshotError(RuntimeError):
+    """Phase α (2026-05-01) — symmetric to forex-live's
+    IncompleteSnapshotError. Raised when build_snapshot is invoked in
+    full_cycle mode but the same-day sidecars produced by `fxe-futures
+    run-once` (or whatever today's executor entrypoint is) are missing.
+    Capture treats `targets={}` paired with nonzero broker positions
+    as "every target is zero" and fires false-positive drift criticals
+    — refusing the snapshot at build-time keeps the bad row from ever
+    entering monitor.db. Operators who want a snapshot without prior
+    run-once must pass `snapshot_mode="snapshot_only"`.
+    """
+
+
 def build_snapshot(
     config: ExecutorConfig,
     broker: BrokerConnection,
@@ -457,14 +470,54 @@ def build_snapshot(
     run_date: str | None = None,
     run_timestamp: str | None = None,
     strategies_yaml_path: Path | None = None,
+    snapshot_mode: str = "full_cycle",
 ) -> Snapshot:
     """Build the canonical daily Snapshot for futures-live.
 
     ``tracking_since_iso`` is the lower bound for transactions_since.
     The monitor filters down to the actual tracking_start on its side.
+
+    ``snapshot_mode`` (Phase α, 2026-05-01):
+      - "full_cycle"   — default. Same-day ``targets_<date>.json`` and
+                          ``close_prices_<date>.json`` MUST exist.
+                          Missing → raise IncompleteSnapshotError.
+      - "snapshot_only" — explicit ad-hoc operator path. Sidecars
+                          optional; provenance flags ride on the snapshot
+                          so capture can degrade gracefully (no drift
+                          comparison against zero targets).
     """
+    if snapshot_mode not in ("full_cycle", "snapshot_only"):
+        raise ValueError(
+            f"snapshot_mode must be 'full_cycle' or 'snapshot_only', got {snapshot_mode!r}"
+        )
     run_timestamp = run_timestamp or datetime.now(timezone.utc).isoformat()
     run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Phase α: probe sidecar existence BEFORE loading so we refuse early
+    # in full_cycle mode. Mirror of forex-live's enforcement (commit
+    # ce4a75e). Note futures-live's close_prices file is usually written
+    # by the executor's run-once step too, but a missing one degrades
+    # gracefully on the data side (parquet fallback at line ~488). The
+    # validity check here is about run-once having actually happened,
+    # which the BOTH-sidecar probe captures.
+    audit_dir = Path(config.audit.db_path).parent
+    targets_path = audit_dir / f"targets_{run_date}.json"
+    close_prices_path = audit_dir / f"close_prices_{run_date}.json"
+    has_targets_file = targets_path.exists()
+    has_close_prices_file = close_prices_path.exists()
+    if snapshot_mode == "full_cycle":
+        missing: list[str] = []
+        if not has_targets_file:
+            missing.append(str(targets_path))
+        if not has_close_prices_file:
+            missing.append(str(close_prices_path))
+        if missing:
+            raise IncompleteSnapshotError(
+                f"build_snapshot(snapshot_mode='full_cycle') requires same-day "
+                f"sidecars written by `run-once`. Missing: {missing}. "
+                "Run the executor first, or pass `--snapshot-only` "
+                "to explicitly capture without drift comparison."
+            )
 
     account_info = broker.get_account_info()
     # account_realized_pnl_amount is filled in below after _net_positions
@@ -587,6 +640,9 @@ def build_snapshot(
         min_delta_lots=float(config.execution.abs_threshold),  # in contracts
         vol_target=vol_target_dict,
         per_strategy_targets=per_strategy_targets,
+        has_targets=has_targets_file,
+        has_close_prices=has_close_prices_file,
+        snapshot_mode=snapshot_mode,
     )
 
 
