@@ -129,15 +129,22 @@ def _net_positions(
     usd_to_account: float,
     exec_to_portfolio: dict[str, str],
     multiplier_map: dict[str, float],
-) -> list[PositionSnap]:
+) -> tuple[list[PositionSnap], float]:
     """Convert broker positions to PositionSnap rows keyed on portfolio symbol.
 
     Effective fraction is in ACCOUNT currency:
       notional_account_ccy = contracts × multiplier × close_usd × usd_to_account
       effective_fraction   = notional_account_ccy / equity_account_ccy
+
+    Phase β (2026-05-01): also returns the account-level realized P/L
+    summed over the futures positions returned by the broker. IBKR
+    settles futures MTM into balance daily; capture uses the
+    day-over-day delta of this sum to explain the part of Δbalance that
+    is broker-side daily settlement (not in audit.db transactions).
     """
     raw = broker.get_positions()
     out: list[PositionSnap] = []
+    sum_realized_account = 0.0
     for p in raw:
         p_sym = exec_to_portfolio.get(p.symbol, p.symbol)
         side = "LONG" if p.position > 0 else "SHORT"
@@ -148,16 +155,26 @@ def _net_positions(
         if equity_account_ccy > 0 and mark_usd > 0:
             notional_account = contracts * multiplier * mark_usd * usd_to_account
             eff = notional_account / equity_account_ccy
+        # Phase β: per-position unrealized P/L from broker (ib.portfolio()
+        # via BrokerPosition.unrealized_pnl). IBKR returns these in
+        # account currency already — no conversion needed. Defaults to
+        # 0.0 when the portfolio() lookup missed (rare; handled in
+        # broker.get_positions). Replaces the previous hardcoded 0.0
+        # placeholder which made every futures-MTM equity move read as
+        # "unexplained" downstream.
+        unrl_account = float(p.unrealized_pnl)
+        rlz_account = float(p.realized_pnl)
+        sum_realized_account += rlz_account
         out.append(PositionSnap(
             label=p.local_symbol or p_sym,
             instrument=p_sym,           # MONITOR KEYS ON PORTFOLIO SYMBOL (stable across rolls)
             side=side,
             amount=contracts,
             open_price=float(p.avg_cost) / multiplier if multiplier else 0.0,
-            unrealized_pnl_amount=0.0,  # IBKR per-position unrealized requires reqPnLSingle subscription
+            unrealized_pnl_amount=unrl_account,
             effective_fraction=eff,
         ))
-    return out
+    return out, sum_realized_account
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +467,10 @@ def build_snapshot(
     run_date = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     account_info = broker.get_account_info()
+    # account_realized_pnl_amount is filled in below after _net_positions
+    # has summed it across futures-only positions; we construct AccountSnap
+    # in two steps so the per-position FUT/CONTFUT filter applies before
+    # the field is stamped (excludes warrants etc. from the total).
     account = AccountSnap(
         equity=float(account_info.equity),
         balance=float(account_info.equity),  # futures: equity ≈ balance (no separate cash concept exposed)
@@ -491,10 +512,15 @@ def build_snapshot(
             f"(EURUSD={eurusd_spot:.5f})"
         )
 
-    positions = _net_positions(
+    positions, sum_realized_account = _net_positions(
         broker, close_prices, account.equity, usd_to_account,
         exec_to_portfolio, multiplier_map,
     )
+    # Stamp the futures-only realized total so capture can use Δ across
+    # captures to recognize IBKR's daily MTM settlement. Always non-None
+    # for futures (even at 0.0 when no closes have happened yet) —
+    # capture's branch is "field present" not "field non-zero".
+    account.account_realized_pnl_amount = sum_realized_account
 
     fills, transactions = _fills_and_transactions_from_audit(
         Path(config.audit.db_path), run_date, tracking_since_iso,

@@ -37,6 +37,15 @@ class BrokerPosition:
     position: float  # signed: +long, -short
     avg_cost: float
     multiplier: float
+    # Phase β (2026-05-01): broker-truth P/L per position. Sourced from
+    # ib.portfolio() (PortfolioItem) which carries unrealizedPNL +
+    # realizedPNL automatically — no reqPnLSingle subscription needed.
+    # Account currency, native sign (positive = profit). Default 0.0
+    # for callers that build BrokerPosition without a portfolio() lookup
+    # (e.g. tests, or get_positions_by_symbol's aggregation path).
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    market_price: float = 0.0  # current mark; useful for dashboard sanity-check
 
     @property
     def display_contract(self) -> str:
@@ -116,13 +125,42 @@ class BrokerConnection:
         return info
 
     def get_positions(self) -> list[BrokerPosition]:
-        """Fetch all current futures positions."""
+        """Fetch all current futures positions, enriched with broker-truth
+        unrealized + realized P/L from ib.portfolio().
+
+        ib.positions() carries position size + avg_cost; ib.portfolio()
+        carries unrealizedPNL + realizedPNL + marketPrice. We zip them
+        on conId so each BrokerPosition has the full P/L picture.
+        Filters out non-futures (warrants, stocks) — clean by
+        construction, no dashboard contamination from unrelated
+        instruments held in the same account.
+        """
+        # Build conId-keyed map of portfolio items for the P/L join.
+        # ib.portfolio() returns PortfolioItem with marketPrice +
+        # unrealizedPNL + realizedPNL in account currency. Empty list
+        # before IBKR's first portfolio update arrives — handle by
+        # defaulting to 0.0 (caller sees a snapshot with no MTM info,
+        # not a crash).
+        portfolio_by_conid: dict[int, "object"] = {}
+        try:
+            for item in self.ib.portfolio():
+                portfolio_by_conid[item.contract.conId] = item
+        except Exception as e:
+            logger.warning(
+                f"ib.portfolio() lookup failed: {e}; per-position "
+                "unrealized + realized will default to 0.0"
+            )
+
         positions = self.ib.positions()
         result = []
         for pos in positions:
             c = pos.contract
             if c.secType not in ("FUT", "CONTFUT"):
                 continue
+            pi = portfolio_by_conid.get(c.conId)
+            unrl = float(pi.unrealizedPNL) if pi is not None else 0.0
+            rlz = float(pi.realizedPNL) if pi is not None else 0.0
+            mkt = float(pi.marketPrice) if pi is not None else 0.0
             result.append(BrokerPosition(
                 symbol=c.symbol,
                 con_id=c.conId,
@@ -132,6 +170,9 @@ class BrokerConnection:
                 position=float(pos.position),
                 avg_cost=float(pos.avgCost),
                 multiplier=float(c.multiplier) if c.multiplier else 1.0,
+                unrealized_pnl=unrl,
+                realized_pnl=rlz,
+                market_price=mkt,
             ))
         return result
 

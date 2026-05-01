@@ -160,6 +160,7 @@ def test_build_snapshot_round_trips_and_computes_effective_fraction(tmp_path):
             symbol="MES", con_id=1, contract_month="202506",
             local_symbol="MESM6", exchange="CME", position=2.0,
             avg_cost=22_600.0, multiplier=5.0,
+            unrealized_pnl=315.50, realized_pnl=120.00, market_price=4_531.55,
         ),
     ]
     broker = _fake_broker(equity=10_000.0, positions=positions)
@@ -179,6 +180,10 @@ def test_build_snapshot_round_trips_and_computes_effective_fraction(tmp_path):
     assert snap.account.equity == 10_000.0
     assert snap.account.account_id == "DU123456"
     assert snap.portfolio_leverage == 5.0
+    # Phase β (2026-05-01): account-level realized P/L is the sum of
+    # per-position realizedPNL across futures-only positions. With one
+    # MES position carrying realized_pnl=120.00, sum = 120.00.
+    assert snap.account.account_realized_pnl_amount == pytest.approx(120.00)
 
     # Positions: one MES long mapped to portfolio symbol ES.
     assert len(snap.positions) == 1
@@ -188,6 +193,8 @@ def test_build_snapshot_round_trips_and_computes_effective_fraction(tmp_path):
     assert pos.amount == 2.0
     # effective_fraction = 2 × 5 × 4520 / 10_000 = 4.52
     assert pos.effective_fraction == pytest.approx(4.52)
+    # Phase β: per-position unrealized P/L flows from broker to snapshot.
+    assert pos.unrealized_pnl_amount == pytest.approx(315.50)
 
     # Fill from audit.db: 2 contracts BUY, fill 4520.50 vs bar close 4520.00,
     # multiplier 5 → slippage_amount = +1 × 0.50 × 5 × 2 = +5.00 USD.
