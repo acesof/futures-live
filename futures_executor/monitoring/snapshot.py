@@ -172,6 +172,14 @@ def _net_positions(
             amount=contracts,
             open_price=float(p.avg_cost) / multiplier if multiplier else 0.0,
             unrealized_pnl_amount=unrl_account,
+            # Phase γ-minimum (2026-05-01): IBKR doesn't have JForex's
+            # IOrder vs IReport-position basis split — both fields
+            # legitimately carry the same broker-truth unrealized number
+            # for futures. Without this, the dashboard's "Floating P/L
+            # (adv.)" tile shows em-dash on futures sets because
+            # capture's _total_broker_floating_pnl only sums entries
+            # where broker_unrealized_pnl_amount is not None.
+            broker_unrealized_pnl_amount=unrl_account,
             effective_fraction=eff,
         ))
     return out, sum_realized_account

@@ -195,6 +195,10 @@ def test_build_snapshot_round_trips_and_computes_effective_fraction(tmp_path):
     assert pos.effective_fraction == pytest.approx(4.52)
     # Phase β: per-position unrealized P/L flows from broker to snapshot.
     assert pos.unrealized_pnl_amount == pytest.approx(315.50)
+    # Phase γ-minimum: broker_unrealized mirrors unrealized for futures
+    # (IBKR doesn't have JForex's IOrder/IReport split). Without this
+    # the dashboard's Floating P/L tile shows em-dash on futures sets.
+    assert pos.broker_unrealized_pnl_amount == pytest.approx(315.50)
 
     # Fill from audit.db: 2 contracts BUY, fill 4520.50 vs bar close 4520.00,
     # multiplier 5 → slippage_amount = +1 × 0.50 × 5 × 2 = +5.00 USD.
