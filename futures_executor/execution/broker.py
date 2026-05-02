@@ -80,22 +80,42 @@ class BrokerConnection:
         self._connected = False
 
     def connect(self) -> None:
-        """Connect to IB Gateway."""
+        """Connect to IB Gateway with stuck-clientId fallback (P3 of
+        PLAN_SHARED_RESILIENCE).
+
+        Routes through R-factory's shared
+        ``ibkr_io.connect_ib_with_fallback`` — same primitive forex's
+        CLI uses. Tries the primary clientId first; falls through to
+        7 neighbors on TimeoutError. Survives stuck-clientId state
+        on IB Gateway side without manual restart.
+        """
         if self._connected:
             return
+        from algo_research_factory.src.data.ibkr_io import connect_ib_with_fallback
+
+        # Candidate range chosen to stay well clear of forex/R-factory
+        # clientIds (3..10). Default primary 101; 7 fallbacks for
+        # headroom on the rare case of multiple stuck IDs.
+        primary = self.settings.client_id
+        candidates: tuple[int, ...] = (
+            primary, primary + 1, primary + 2, primary + 3,
+            primary + 4, primary + 5, primary + 6, primary + 7,
+        )
         logger.info(
             f"Connecting to IB Gateway at {self.settings.host}:{self.settings.port} "
-            f"(clientId={self.settings.client_id})"
+            f"(primary clientId={primary}; fallbacks {candidates[1:]})"
         )
-        self.ib.connect(
+        # connect_ib_with_fallback returns its own IB instance;
+        # replace self.ib so subsequent ops use the connected one.
+        self.ib, used_cid = connect_ib_with_fallback(
             self.settings.host,
             self.settings.port,
-            clientId=self.settings.client_id,
+            candidate_client_ids=candidates,
+            timeout_seconds=self.settings.timeout,
             readonly=self.settings.readonly,
-            timeout=self.settings.timeout,
         )
         self._connected = True
-        logger.info("Connected to IB Gateway")
+        logger.info(f"Connected to IB Gateway (clientId={used_cid})")
 
     def disconnect(self) -> None:
         """Disconnect from IB Gateway."""
