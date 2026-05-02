@@ -3,83 +3,78 @@
 #   1. R-factory:    data ingest-futures-ibkr (pick up today's final daily bar)
 #   2. futures-live: snapshot               (canonical Snapshot JSON)
 #   3. R-factory:    monitor run            (sim replay + capture + render)
-#   4. R-factory:    monitor check → futures-executor notify on findings
+#   4. R-factory:    monitor check          (Signal on warning/critical)
 #
-# Fires ~30 min after CME close (17:30 ET) — gives IBKR time to publish
-# today's completed daily bar. Scheduled by cron at 23:30 and 00:30 local
-# (Mon-Fri) with the ET_HOUR=17 gate picking one per DST season.
+# Fires ~30 min after CME close (NY 17:30 ET) — gives IBKR time to
+# publish today's completed daily bar. Cron schedules at Vilnius
+# 23:30 / 00:30 (Mon-Fri); et_gate_hour 17 picks one per DST season.
 #
-# Trading happens in run_daily.sh at 16:55 ET (5 min before close) —
-# that's a SEPARATE script; this one is monitor-only.
+# Trading happens in run_daily.sh at NY 16:55 ET — separate script;
+# this one is monitor-only.
+#
+# Resilience scaffolding (trap, pre-flight, monitor check + notify)
+# lives in R-factory/scripts/cron_lib.sh — shared with run_daily.sh +
+# forex-live's cron scripts. See PLAN_SHARED_RESILIENCE.md.
 set -euo pipefail
 
-# Only do real work at 5pm-hour ET — after CME close and bar
-# publication.
-ET_HOUR=$(TZ='America/New_York' date +%H)
-if [ "$ET_HOUR" != "17" ]; then
-    exit 0
-fi
+SCRIPT_NAME="monitor_cycle.sh"
 
 INSTRUMENT_SET="${INSTRUMENT_SET:-futures_mini}"
 R_FACTORY_DIR="${R_FACTORY_DIR:-/Users/acess/projects/R-factory}"
 FUTURES_LIVE_DIR="${FUTURES_LIVE_DIR:-/Users/acess/projects/futures-live}"
 CONDA_BASE="${CONDA_BASE:-/Users/acess/miniforge3}"
-LOG_DIR="${LOG_DIR:-$FUTURES_LIVE_DIR/logs}"
-LOG_FILE="$LOG_DIR/monitor_cycle_$(date -u +%Y%m%d_%H%M%S).log"
-mkdir -p "$LOG_DIR"
+PROJECT_LOG_DIR="${PROJECT_LOG_DIR:-$FUTURES_LIVE_DIR}"
+NOTIFY_PROJECT_DIR="$FUTURES_LIVE_DIR"
+NOTIFY_CMD="futures-executor notify"
 
-echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') — monitor_cycle start (set=$INSTRUMENT_SET)" | tee "$LOG_FILE"
+# shellcheck source=/Users/acess/projects/R-factory/scripts/cron_lib.sh
+source "$R_FACTORY_DIR/scripts/cron_lib.sh"
 
-# Conda base — both R-factory and futures-executor installed editable there.
+# 1. Wrong-season-fire gate — NY 17:00 hour (post-close, daily bar
+#    available).
+et_gate_hour 17
+
+cron_lib_log_setup "monitor_cycle"
+cron_lib_init
+register_trap_alert
+
+echo "$(cron_lib_ts) — monitor_cycle start (set=$INSTRUMENT_SET)" | tee "$LOG_FILE"
+
+# Conda init for cron.
 # shellcheck disable=SC1090,SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate base
 
-# 1. Refresh R-factory's canonical continuous-series parquet — now that
-#    today's daily bar is finalised by IBKR.
+mark_started
+
+# Pre-flight: IB Gateway TCP. Step (1) below would otherwise hang for
+# 60s on dead Gateway.
+pre_flight_ibkr_gateway
+
+# 1. Refresh R-factory's continuous-series parquet — today's daily
+#    bar is settled by IBKR.
+mark_step "data ingest-futures-ibkr"
 (cd "$R_FACTORY_DIR" && python -m algo_research_factory.cli data ingest-futures-ibkr \
     --instrument-set "$INSTRUMENT_SET" --yes) 2>&1 | tee -a "$LOG_FILE"
 
-# 2. Write the canonical snapshot (broker positions + today's fills from
-#    audit.db + targets/close_prices persisted by run_daily.sh earlier).
+# 2. Write the canonical snapshot.
+mark_step "futures-executor snapshot"
 (cd "$FUTURES_LIVE_DIR" && futures-executor snapshot \
     --instrument-set "$INSTRUMENT_SET") 2>&1 | tee -a "$LOG_FILE"
 
-# 3. Monitor: replay sim against the freshly-ingested parquet, capture
-#    today's row, regenerate the dashboard.
+# 3. Monitor: replay sim, capture today's row, regenerate dashboard.
 #
-# --balance-tol-bps 100 (= 1% of equity): TACTICAL bump. Futures balance
-# settles daily via mark-to-market on still-open positions, which is not
-# in the txn-driven Δexpected — so Δactual − Δexpected drifts by the day's
-# MTM (typically 0.05–0.5% on this portfolio). Default 1 bp would refuse
-# every day. Tighten back to default once the futures-aware reconciliation
-# (item #2 in 2026-04-29 review) ships.
+# --balance-tol-bps 100 (= 1% of equity): TACTICAL bump. Futures
+# balance settles daily via mark-to-market on still-open positions,
+# which isn't in the txn-driven Δexpected — so Δactual − Δexpected
+# drifts by the day's MTM. Default 1 bp would refuse every day.
+# Tighten back once the futures-aware reconciliation lands.
+mark_step "monitor run"
 (cd "$R_FACTORY_DIR" && python -m algo_research_factory.cli monitor run \
     --instrument-set "$INSTRUMENT_SET" \
     --balance-tol-bps 100) 2>&1 | tee -a "$LOG_FILE"
 
-# 4. Health checks → Signal on any warning/critical.
-FINDINGS_FILE="$(mktemp -t monitor_findings)"
-(cd "$R_FACTORY_DIR" && python -m algo_research_factory.cli monitor check \
-    --instrument-set "$INSTRUMENT_SET" --severity warning \
-    > "$FINDINGS_FILE") || CHECK_RC=$?
-CHECK_RC="${CHECK_RC:-0}"
-cat "$FINDINGS_FILE" | tee -a "$LOG_FILE"
-if [ "$CHECK_RC" -ne 0 ]; then
-    # Exit code 1 = warning present, 2 = critical present (see
-    # cmd_monitor_check). Pick emoji accordingly.
-    if [ "$CHECK_RC" -ge 2 ]; then
-        MONITOR_EMOJI="🚨"
-    else
-        MONITOR_EMOJI="⚠️"
-    fi
-    (cd "$FUTURES_LIVE_DIR" && futures-executor notify \
-        --prefix "$MONITOR_EMOJI Futures Monitor ($INSTRUMENT_SET)" < "$FINDINGS_FILE") \
-        2>&1 | tee -a "$LOG_FILE" || true
-fi
-rm -f "$FINDINGS_FILE"
+# 4. Health checks → Signal on warning/critical.
+monitor_check_and_notify "$INSTRUMENT_SET" "Futures Monitor ($INSTRUMENT_SET)"
 
-echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') — monitor_cycle done" | tee -a "$LOG_FILE"
-
-# Prune logs older than 30 days.
-find "$LOG_DIR" -name "monitor_cycle_*.log" -mtime +30 -delete 2>/dev/null || true
+echo "$(cron_lib_ts) — monitor_cycle done" | tee -a "$LOG_FILE"

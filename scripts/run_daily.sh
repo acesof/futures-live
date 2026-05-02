@@ -1,40 +1,62 @@
 #!/usr/bin/env bash
-# Daily execution wrapper — called by cron
-# Runs at 4:55pm ET (before CME 5pm maintenance break).
-# Builds today's bar from 5-min intraday, executes while market is live.
-# Scheduled at 22:55 and 23:55 local to cover DST spring gap.
+# Daily futures trading wrapper — called by cron.
+#
+# Fires NY 16:55 ET (5 min before CME close) — synthesizes today's
+# daily bar from 5-min intraday data, generates signals, and submits
+# orders while the market is still live. CME closes at 17:00 ET
+# Mon-Thu (Fri close at 16:00 ET on settlement day, but the in-bar
+# generation handles either).
+#
+# Cron firing schedule (DST-dual): 22:55 / 23:55 Vilnius local;
+# et_gate_hour 16 below silently exits the wrong-season fire.
+#
+# Resilience scaffolding (trap, pre-flight) lives in
+# R-factory/scripts/cron_lib.sh — shared with monitor_cycle.sh +
+# forex-live's daily_cycle.sh + friday_cycle.sh + sunday_recovery.sh.
+# See PLAN_SHARED_RESILIENCE.md.
 set -euo pipefail
 
-# Only run if it's currently 4pm hour (16:xx) US Eastern
-ET_HOUR=$(TZ='America/New_York' date +%H)
-if [ "$ET_HOUR" != "16" ]; then
-    exit 0
-fi
+SCRIPT_NAME="run_daily.sh"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_DIR="$PROJECT_DIR/logs"
-LOG_FILE="$LOG_DIR/futures_$(date -u +%Y%m%d_%H%M%S).log"
+INSTRUMENT_SET="${INSTRUMENT_SET:-futures_mini}"
+R_FACTORY_DIR="${R_FACTORY_DIR:-/Users/acess/projects/R-factory}"
+FUTURES_LIVE_DIR="${FUTURES_LIVE_DIR:-/Users/acess/projects/futures-live}"
+CONDA_BASE="${CONDA_BASE:-/Users/acess/miniforge3}"
+PROJECT_LOG_DIR="${PROJECT_LOG_DIR:-$FUTURES_LIVE_DIR}"
+NOTIFY_PROJECT_DIR="$FUTURES_LIVE_DIR"
+NOTIFY_CMD="futures-executor notify"
 
-mkdir -p "$LOG_DIR"
+# shellcheck source=/Users/acess/projects/R-factory/scripts/cron_lib.sh
+source "$R_FACTORY_DIR/scripts/cron_lib.sh"
 
-echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') — Starting futures executor daily run" | tee "$LOG_FILE"
+# 1. Wrong-season-fire gate — only NY 16:00 hour (16:55 fire window).
+et_gate_hour 16
 
-# Source conda init for cron (conda not on PATH by default)
-CONDA_BASE="/Users/acess/miniforge3"
+# 2. Per-run log + 30-day prune. Keeping legacy `futures_*.log` basename
+#    for log-rotation / heartbeat compat.
+cron_lib_log_setup "futures"
+
+# 3. Trap — Signal-alerts non-zero exit AFTER mark_started.
+cron_lib_init
+register_trap_alert
+
+echo "$(cron_lib_ts) — Starting futures executor daily run (set=$INSTRUMENT_SET)" | tee "$LOG_FILE"
+
+# Conda init for cron (PATH=/usr/bin:/bin in cron's default env).
+# shellcheck disable=SC1090,SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate base
 
-cd "$PROJECT_DIR"
+cd "$FUTURES_LIVE_DIR"
 
-# Run
+mark_started
+
+# Pre-flight: IB Gateway TCP. Fail fast on dead Gateway instead of
+# wasting 60s on a hanging connect call. (No JForex bridge in this
+# stack — IBKR direct.)
+pre_flight_ibkr_gateway
+
+mark_step "futures-executor run-once"
 futures-executor run-once 2>&1 | tee -a "$LOG_FILE"
 
-EXIT_CODE=${PIPESTATUS[0]}
-
-echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') — Futures executor finished with exit code $EXIT_CODE" | tee -a "$LOG_FILE"
-
-# Clean up old logs (keep 30 days)
-find "$LOG_DIR" -name "futures_*.log" -mtime +30 -delete 2>/dev/null || true
-
-exit $EXIT_CODE
+echo "$(cron_lib_ts) — Futures executor finished" | tee -a "$LOG_FILE"
