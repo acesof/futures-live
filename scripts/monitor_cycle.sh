@@ -47,9 +47,9 @@ conda activate base
 
 mark_started
 
-# Pre-flight: IB Gateway TCP. Step (1) below would otherwise hang for
-# 60s on dead Gateway.
-pre_flight_ibkr_gateway
+# IB Gateway pre-flight removed 2026-05-05 — port-listening != API-ready.
+# data ingest-futures-ibkr's connect_ib uses patient retry on
+# TimeoutError to handle Gateway-not-yet-ready cases.
 
 # 1. Refresh R-factory's continuous-series parquet — today's daily
 #    bar is settled by IBKR.

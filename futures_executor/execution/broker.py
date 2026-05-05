@@ -80,42 +80,45 @@ class BrokerConnection:
         self._connected = False
 
     def connect(self) -> None:
-        """Connect to IB Gateway with stuck-clientId fallback (P3 of
-        PLAN_SHARED_RESILIENCE).
+        """Connect to IB Gateway with patient single-clientId retry.
 
-        Routes through R-factory's shared
-        ``ibkr_io.connect_ib_with_fallback`` — same primitive forex's
-        CLI uses. Tries the primary clientId first; falls through to
-        7 neighbors on TimeoutError. Survives stuck-clientId state
-        on IB Gateway side without manual restart.
+        Routes through R-factory's shared ``ibkr_io.connect_ib``:
+        single fixed clientId, exponential backoff on TimeoutError /
+        ConnectionError (1s → ×1.6 → cap 20s), no force-disconnect
+        on failure, default 180s total budget.
+
+        Replaces the prior ``connect_ib_with_fallback`` (rapid 8-
+        clientId walk + disconnect-on-fail) which corrupted Gateway
+        state under load — verified 2026-05-05 incident: futures
+        run_daily walked 101→104 the same night Gateway went
+        unhealthy, and forex daily_cycle then exhausted 3-10 mid-
+        watcher-restart. Pre-2026-05-03 broker.py (and other live
+        projects) used a single clientId connect with no retry — this
+        is the same simple model plus a patient backoff to bridge
+        watcher-restart windows.
+
+        ``readonly`` stays False here (executor places orders) — the
+        broker.py path is the one consumer that genuinely needs full
+        non-readonly sync. Read-only consumers (forex CLI, futures
+        CLI ingest) pass readonly=True.
         """
         if self._connected:
             return
-        from algo_research_factory.src.data.ibkr_io import connect_ib_with_fallback
+        from algo_research_factory.src.data.ibkr_io import connect_ib
 
-        # Candidate range chosen to stay well clear of forex/R-factory
-        # clientIds (3..10). Default primary 101; 7 fallbacks for
-        # headroom on the rare case of multiple stuck IDs.
-        primary = self.settings.client_id
-        candidates: tuple[int, ...] = (
-            primary, primary + 1, primary + 2, primary + 3,
-            primary + 4, primary + 5, primary + 6, primary + 7,
-        )
         logger.info(
             f"Connecting to IB Gateway at {self.settings.host}:{self.settings.port} "
-            f"(primary clientId={primary}; fallbacks {candidates[1:]})"
+            f"(clientId={self.settings.client_id})"
         )
-        # connect_ib_with_fallback returns its own IB instance;
-        # replace self.ib so subsequent ops use the connected one.
-        self.ib, used_cid = connect_ib_with_fallback(
+        self.ib = connect_ib(
             self.settings.host,
             self.settings.port,
-            candidate_client_ids=candidates,
+            client_id=self.settings.client_id,
             timeout_seconds=self.settings.timeout,
             readonly=self.settings.readonly,
         )
         self._connected = True
-        logger.info(f"Connected to IB Gateway (clientId={used_cid})")
+        logger.info(f"Connected to IB Gateway (clientId={self.settings.client_id})")
 
     def disconnect(self) -> None:
         """Disconnect from IB Gateway."""

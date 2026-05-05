@@ -51,10 +51,10 @@ cd "$FUTURES_LIVE_DIR"
 
 mark_started
 
-# Pre-flight: IB Gateway TCP. Fail fast on dead Gateway instead of
-# wasting 60s on a hanging connect call. (No JForex bridge in this
-# stack — IBKR direct.)
-pre_flight_ibkr_gateway
+# IB Gateway pre-flight removed 2026-05-05 — port-listening doesn't
+# imply API-ready, and the executor's BrokerConnection.connect() now
+# uses connect_ib with patient retry on TimeoutError. No JForex
+# bridge in this stack — IBKR direct.
 
 mark_step "futures-executor run-once"
 futures-executor run-once 2>&1 | tee -a "$LOG_FILE"
