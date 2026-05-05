@@ -7,6 +7,9 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from futures_executor.config.loader import load_settings, load_strategies
 from futures_executor.state import (
     get_active_contracts,
@@ -50,9 +53,22 @@ def _check_kill_switch(config) -> bool:
 
 
 def cmd_run_once(args):
-    """Execute one rebalance cycle."""
-    from futures_executor.data.bar_fetcher import BarFetcher
-    from futures_executor.data.continuous_series import ContinuousSeries
+    """Execute one rebalance cycle.
+
+    Market data is read from R-factory's canonical parquet rather than
+    a fresh IBKR fetch (futures Option 2, 2026-05-05). The cron
+    sequence runs ``data ingest-futures-ibkr --synthesize-eod`` —
+    which IS the IBKR fetch, owned by R-factory — immediately before
+    ``futures-executor run-once``, so the parquet has today's
+    synthesized bar when this runs. Eliminates the live/replay
+    window-mismatch (live local ContinuousSeries vs replay's full
+    parquet history producing different signals on edge cases —
+    monitor.db on 2026-05-05 surfaced CL/ES/GC target ≠ sim).
+
+    BrokerConnection (IBKR) is still used for: account info,
+    contract resolution, position queries, order placement. Only
+    the historical bar fetch is replaced with parquet read.
+    """
     from futures_executor.data.contract_resolver import ContractResolver
     from futures_executor.execution.broker import BrokerConnection
     from futures_executor.execution.order_manager import OrderManager
@@ -132,46 +148,56 @@ def cmd_run_once(args):
         # Daily evaluation — thresholds decide whether to trade
         order_mgr = OrderManager(broker, config)
 
-        # Fetch bars + build continuous series
-        bar_fetcher = BarFetcher(broker.ib, Path(config.data.bar_history_dir))
-        continuous = ContinuousSeries(Path(config.data.continuous_dir))
-
-        for symbol, pair in contract_pairs.items():
-            lookback = config.data.lookback_bars
-            if lookback > 365:
-                # IBKR rejects day durations > 365; convert to years
-                years = (lookback // 365) + 1
-                duration_str = f"{years} Y"
-            else:
-                duration_str = f"{lookback} D"
-            front_bars = bar_fetcher.fetch_and_cache(
-                pair.front.contract, symbol,
-                duration=duration_str,
-            )
-
-            # Build today's bar from 5-min intraday (not yet in daily history)
-            today_bar = bar_fetcher.fetch_todays_bar(pair.front.contract)
-            if not today_bar.empty:
-                import pandas as pd
-                front_bars = pd.concat([front_bars, today_bar], ignore_index=True)
-
-            next_bars = None
-            if pair.next:
-                next_bars = bar_fetcher.fetch_bars(
-                    pair.next.contract, duration="5 D",
-                )
-            continuous.update(symbol, front_bars, pair, next_bars)
-
-        # Build MarketData and compute signals
-        # Import R-factory MarketData interface
+        # Load market data from R-factory's canonical parquet.
+        # Replaces the prior bar_fetcher + own-ContinuousSeries flow
+        # which produced different signals than the monitor's replay
+        # (futures Option 2, 2026-05-05). Single source of truth.
         sys.path.insert(0, config.rfactory_path)
-        from algo_research_factory.src.strategy.interface import MarketData
+        from algo_research_factory.src.data.loader import load_universe
 
-        # Load continuous series into MarketData format
-        # Strategies see portfolio symbols (NQ, ES, ...) as instrument names
-        market_data = _build_market_data(
-            continuous, contract_pairs, config, exec_to_portfolio,
+        parquet_dir = (
+            Path(config.monitor.r_factory_data_dir)
+            / "parquet" / config.data.parquet_set_name
         )
+        if not parquet_dir.exists():
+            msg = (
+                f"Parquet dir missing: {parquet_dir}. Run "
+                f"`python -m algo_research_factory.cli data ingest-futures-ibkr "
+                f"--instrument-set {config.data.parquet_set_name} "
+                "--synthesize-eod` first."
+            )
+            logger.critical(msg)
+            notifier.notify_error("DATA", msg)
+            return 1
+
+        # Strategies reference portfolio symbols (ES, NQ, CL, GC).
+        # Parquet files are named by portfolio symbol too (verified
+        # 2026-05-05: data/parquet/futures_mini/ contains CL.parquet,
+        # ES.parquet, GC.parquet — NOT MES/MCL/MGC). load_universe
+        # reads by portfolio symbol — no translation needed here.
+        portfolio_symbols = [exec_to_portfolio[s] for s in contract_pairs.keys()]
+        market_data = load_universe(parquet_dir, portfolio_symbols)
+        logger.info(
+            f"Loaded market_data from {parquet_dir}: "
+            f"{market_data.n_bars} bars × {market_data.n_instruments} instruments, "
+            f"last bar {pd.Timestamp(market_data.dates[-1]).date()}"
+        )
+
+        # Refuse on stale parquet — > N BD old means data ingest
+        # didn't run cleanly upstream. Hard-refuse and let the trap
+        # fire so the operator investigates ingest before live retries.
+        last_bar_date = pd.Timestamp(market_data.dates[-1]).normalize().date()
+        today_utc = pd.Timestamp.utcnow().tz_localize(None).normalize().date()
+        bd_age = int(np.busday_count(last_bar_date, today_utc))
+        if bd_age > config.data.max_parquet_age_business_days:
+            msg = (
+                f"Parquet stale: last bar {last_bar_date} is {bd_age} business "
+                f"days old (> {config.data.max_parquet_age_business_days}). "
+                f"Investigate `data ingest-futures-ibkr --synthesize-eod` upstream."
+            )
+            logger.critical(msg)
+            notifier.notify_error("DATA", msg)
+            return 1
 
         # Compute aggregate target signals (keyed by portfolio symbol).
         # Phase 1 attribution: also captures per-strategy contributions so
@@ -753,82 +779,6 @@ def cmd_slippage(args):
         print(f"  Slippage: mean={sum(slips)/len(slips):+.4f}  max={max(slips, key=abs):+.4f}")
 
     return 0
-
-
-def _build_market_data(continuous, contract_pairs, config, exec_to_portfolio=None):
-    """Build a MarketData-compatible object from continuous series.
-
-    Loads each instrument's continuous parquet series and stacks into
-    the MarketData format expected by R-factory strategies.
-    Uses portfolio symbols (NQ, ES, ...) as instrument_names so strategies
-    see the same names as in backtesting.
-    """
-    import numpy as np
-
-    sys.path.insert(0, config.rfactory_path)
-    from algo_research_factory.src.strategy.interface import MarketData
-
-    exec_symbols = sorted(contract_pairs.keys())
-    all_series = {}
-    for symbol in exec_symbols:
-        df = continuous.load(symbol)
-        if df is not None and not df.empty:
-            all_series[symbol] = df
-
-    if not all_series:
-        raise ValueError("No continuous series data available")
-
-    # Align dates across all instruments
-    # Use intersection of dates
-    date_sets = [set(df["date"].dt.date) for df in all_series.values()]
-    common_dates = sorted(set.intersection(*date_sets))
-
-    if len(common_dates) < 50:
-        raise ValueError(
-            f"Only {len(common_dates)} common dates across instruments "
-            f"(need at least 50)"
-        )
-
-    n_bars = len(common_dates)
-    n_inst = len(exec_symbols)
-
-    open_arr = np.zeros((n_bars, n_inst))
-    high_arr = np.zeros((n_bars, n_inst))
-    low_arr = np.zeros((n_bars, n_inst))
-    close_arr = np.zeros((n_bars, n_inst))
-    volume_arr = np.full((n_bars, n_inst), np.nan)
-
-    for j, symbol in enumerate(exec_symbols):
-        df = all_series[symbol]
-        df = df.copy()
-        df["_date"] = df["date"].dt.date
-        df = df[df["_date"].isin(set(common_dates))]
-        df = df.sort_values("_date").reset_index(drop=True)
-
-        open_arr[:, j] = df["open"].values[:n_bars]
-        high_arr[:, j] = df["high"].values[:n_bars]
-        low_arr[:, j] = df["low"].values[:n_bars]
-        close_arr[:, j] = df["close"].values[:n_bars]
-        if "volume" in df.columns:
-            volume_arr[:, j] = df["volume"].values[:n_bars]
-
-    dates_arr = np.array(common_dates, dtype="datetime64[D]")
-
-    # Use portfolio symbols as instrument names so strategies see NQ, ES, etc.
-    if exec_to_portfolio:
-        instrument_names = [exec_to_portfolio.get(s, s) for s in exec_symbols]
-    else:
-        instrument_names = list(exec_symbols)
-
-    return MarketData(
-        open=open_arr,
-        high=high_arr,
-        low=low_arr,
-        close=close_arr,
-        volume=volume_arr,
-        dates=dates_arr,
-        instrument_names=instrument_names,
-    )
 
 
 def _print_dry_run(targets, contract_pairs, equity, config, broker):

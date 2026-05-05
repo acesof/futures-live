@@ -58,10 +58,22 @@ vol_target:
   vol_floor: 0.03
   instrument_level: false  # V1: per-strategy vol targeting
 
+# Data — cmd_run_once reads R-factory's canonical parquet instead of
+# fetching from IBKR directly. The cron sequence runs
+# `data ingest-futures-ibkr --synthesize-eod` first (in run_daily.sh),
+# so parquet has tonight's bar by the time run-once executes.
+# See PLAN_FUTURES_OPTION2 (2026-05-05): unified market_data source
+# eliminates the live/replay window-mismatch where futures-live's
+# local ContinuousSeries (built from a lookback window) produced
+# different signals than R-factory monitor's replay (full parquet).
 data:
+  # Legacy — no longer consumed by run-once after 2026-05-05.
   lookback_bars: 500
   continuous_dir: data/continuous
   bar_history_dir: data/bars
+  # New (futures Option 2):
+  parquet_set_name: futures_mini       # subdir under {monitor.r_factory_data_dir}/parquet/
+  max_parquet_age_business_days: 1     # hard-refuse staler than this
 
 safety:
   max_position_contracts: 100

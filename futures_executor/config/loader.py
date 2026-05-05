@@ -67,9 +67,32 @@ class VolTargetSettings(BaseModel):
 
 
 class DataSettings(BaseModel):
+    """Market-data source for cmd_run_once.
+
+    Post-2026-05-05 (futures Option 2): cmd_run_once reads R-factory's
+    canonical parquet via ``load_universe`` instead of fetching IBKR
+    directly. Eliminates the live/replay window-mismatch where
+    futures-live's local ContinuousSeries (built from a lookback window)
+    produced different signals than R-factory monitor's replay
+    (built from full parquet history). 2026-05-05 monitor.db surfaced
+    the bug as CL/ES/GC target ≠ sim across all 3 instruments.
+    """
+    # Legacy — no longer consumed by cmd_run_once after 2026-05-05.
+    # Kept so existing settings.yaml files don't pydantic-fail on
+    # extra-field strict mode if/when we tighten validation.
     lookback_bars: int = 200
     continuous_dir: str = "data/continuous"
     bar_history_dir: str = "data/bars"
+    # Subdir under ``{monitor.r_factory_data_dir}/parquet/``. Each
+    # futures-live deployment is single-set; this names the set.
+    parquet_set_name: str = "futures_mini"
+    # Hard refusal threshold for parquet staleness — counted in
+    # business days from parquet's last bar to today (UTC). cron
+    # sequence is ``data ingest-futures-ibkr --synthesize-eod`` →
+    # ``futures-executor run-once``, so on a clean cycle the parquet's
+    # last bar IS today (0 BD old). 1 = tolerate the rare case where
+    # ingest succeeded but run-once started right at midnight boundary.
+    max_parquet_age_business_days: int = 1
 
 
 class SafetySettings(BaseModel):

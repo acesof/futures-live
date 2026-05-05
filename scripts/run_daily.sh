@@ -56,6 +56,17 @@ mark_started
 # uses connect_ib with patient retry on TimeoutError. No JForex
 # bridge in this stack — IBKR direct.
 
+# 1. Refresh R-factory parquet with today's synthesized bar (futures
+#    Option 2, 2026-05-05). At NY 16:55 ET (5 min before CME close)
+#    the daily bar hasn't settled yet — synthesize from 5-min intraday
+#    so step 2's run-once reads a parquet with today's in-progress bar.
+#    monitor_cycle.sh later (post-close, 17:30 ET) re-ingests WITHOUT
+#    --synthesize-eod so the IBKR-settled bar overwrites this one.
+mark_step "data ingest-futures-ibkr --synthesize-eod"
+(cd "$R_FACTORY_DIR" && python -m algo_research_factory.cli data ingest-futures-ibkr \
+    --instrument-set "$INSTRUMENT_SET" --synthesize-eod --yes) 2>&1 | tee -a "$LOG_FILE"
+
+# 2. Trade. Reads R-factory parquet (NOT IBKR fetch).
 mark_step "futures-executor run-once"
 futures-executor run-once 2>&1 | tee -a "$LOG_FILE"
 
