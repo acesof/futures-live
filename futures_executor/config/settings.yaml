@@ -82,11 +82,12 @@ safety:
   kill_switch_file: .kill_switch
   heartbeat_timeout: 300
   # Capital controls v1: trip the kill switch automatically if today's loss
-  # exceeds this %. forex_major calibration: worst historical day = -3.35%,
-  # 5% is the smallest threshold not seen in 21 years of sim history.
-  # futures_mini's own xray hasn't been generated yet; recalibrate before
-  # futures real-money launch. ≤0 disables.
-  daily_loss_circuit_pct: 5.0
+  # exceeds this %. ≤0 disables.
+  # forex_major calibration:    worst day = -3.35%, threshold = 5.0% (1.5× margin, 0 trips in 21 yrs).
+  # futures_mini calibration:   worst day = -7.76%, threshold = 10.0% (1.29× margin, 0 trips in 12 yrs).
+  # Calibrated 2026-05-07 from artifacts/futures_mini/portfolio/xray/xray.json
+  # (V1, target_sleeve_vol=0.4, vol_floor=0.03, gross_exposure_cap=5.0, K=12).
+  daily_loss_circuit_pct: 10.0
   reference_equity_file: data/reference_equity.json
 
 audit:
