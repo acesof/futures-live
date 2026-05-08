@@ -231,14 +231,21 @@ def _fills_and_transactions_from_audit(
         conn.close()
 
     fills = [_row_to_fill(r, close_prices, usd_to_account, exec_to_portfolio, multiplier_map)
-             for r in today_rows if _is_real_execution(r)]
+             for r in today_rows if _is_real_fill(r)]
     transactions = [_row_to_transaction(r, usd_to_account, exec_to_portfolio)
-                    for r in window_rows if _is_real_execution(r)]
+                    for r in window_rows if _is_real_transaction(r)]
     return fills, transactions
 
 
-def _is_real_execution(row: sqlite3.Row) -> bool:
-    """Filter out skip/hold/no-op rows — only keep actual fills."""
+def _is_real_fill(row: sqlite3.Row) -> bool:
+    """Strict filter for fills_today: BUY/SELL fills with a fill_price.
+
+    Excludes Combo/Bag (roll) executions: those have NULL action because
+    they're bidirectional (SELL front-month + BUY back-month in one
+    Bag), and the fill_price reported is the spread price (not a real
+    instrument price), so slippage attribution is meaningless. Rolls
+    appear in transactions_since via ``_is_real_transaction`` instead.
+    """
     status = (row["status"] or "").strip().lower()
     action = (row["action"] or "").strip().upper()
     if action not in ("BUY", "SELL"):
@@ -249,6 +256,35 @@ def _is_real_execution(row: sqlite3.Row) -> bool:
     if "fill" not in status:
         return False
     return True
+
+
+def _is_real_transaction(row: sqlite3.Row) -> bool:
+    """Looser filter for transactions_since: include BUY/SELL fills AND
+    Combo/Bag (roll) executions with realized P/L.
+
+    Rolls are ``event_type='roll'`` rows from audit.db. They have NULL
+    ``action`` (Combo orders are bidirectional) but DO carry the closing
+    leg's realized P/L in ``realized_pnl`` — without including them, the
+    snapshot's ``transactions_since`` silently drops the roll's realized
+    P/L. Phase 4 reconciliation surfaced this as a ~−€4,816 gap on the
+    2026-05-07 MCL roll (broker_realized cum reported only −€11 vs
+    actual ~−€5,000 realized loss; equity correctly reflected the loss).
+    """
+    status = (row["status"] or "").strip().lower()
+    action = (row["action"] or "").strip().upper()
+    event_type = (row["event_type"] or "").strip().lower()
+    if "fill" not in status:
+        return False
+    # Regular BUY/SELL with fill_price.
+    if action in ("BUY", "SELL"):
+        return row["fill_price"] is not None
+    # Combo/Bag roll: realized P/L is the closing-leg realization.
+    # action is NULL because the Bag has both directions. fill_price on
+    # roll rows is the spread price (not a real instrument price), so
+    # don't gate on it; gate on event_type + realized_pnl presence.
+    if event_type == "roll" and row["realized_pnl"] is not None:
+        return True
+    return False
 
 
 def _row_to_fill(

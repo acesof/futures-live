@@ -457,6 +457,88 @@ def test_row_to_transaction_reads_realized_pnl_with_usd_to_account_conversion(tm
     conn.close()
 
 
+def test_is_real_transaction_includes_roll_with_null_action(tmp_path):
+    """Combo/Bag (futures roll) executions have NULL action because they're
+    bidirectional. The closing leg's realized_pnl IS captured in audit.db,
+    but the legacy filter rejected the row (action not in BUY/SELL).
+    Bug surfaced 2026-05-07 MCL roll: -€4,816 realized loss missing from
+    transactions_since while equity correctly reflected the loss.
+    """
+    from futures_executor.monitoring.snapshot import (
+        _is_real_transaction,
+        _is_real_fill,
+    )
+
+    db_path = tmp_path / "raw.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE executions (
+            id INTEGER PRIMARY KEY, timestamp TEXT, run_date TEXT, symbol TEXT,
+            event_type TEXT, action TEXT, quantity INTEGER,
+            fill_price REAL, commission REAL, realized_pnl REAL, status TEXT
+        );
+    """)
+    # Roll row mirroring the 2026-05-07 MCL roll: NULL action, event_type=roll,
+    # realized_pnl populated, status=Filled.
+    conn.execute(
+        "INSERT INTO executions (timestamp, run_date, symbol, event_type, action, "
+        "quantity, fill_price, commission, realized_pnl, status) VALUES "
+        "(?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+        ("2026-05-07T20:55:35+00:00", "2026-05-07", "MCL", "roll",
+         7, 62.20, 10.78, -4815.78, "Filled"),
+    )
+    # Regular BUY execution for control.
+    conn.execute(
+        "INSERT INTO executions (timestamp, run_date, symbol, event_type, action, "
+        "quantity, fill_price, commission, realized_pnl, status) VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2026-05-07T20:55:36+00:00", "2026-05-07", "MES", "reconcile",
+         "BUY", 1, 7354.5, 0.62, 0.0, "Filled"),
+    )
+    conn.commit()
+    rows = conn.execute("SELECT * FROM executions").fetchall()
+
+    # Both rows should pass the transaction filter.
+    assert _is_real_transaction(rows[0]) is True   # roll
+    assert _is_real_transaction(rows[1]) is True   # regular BUY
+
+    # Fills filter still strict — roll excluded (NULL action; no real
+    # instrument fill_price for slippage attribution).
+    assert _is_real_fill(rows[0]) is False
+    assert _is_real_fill(rows[1]) is True
+    conn.close()
+
+
+def test_is_real_transaction_excludes_roll_without_realized_pnl(tmp_path):
+    """A roll row missing realized_pnl is malformed audit data — filter it
+    out rather than including a row with realized=0 that would understate
+    the cum total."""
+    from futures_executor.monitoring.snapshot import _is_real_transaction
+
+    db_path = tmp_path / "raw.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE executions (
+            id INTEGER PRIMARY KEY, timestamp TEXT, run_date TEXT, symbol TEXT,
+            event_type TEXT, action TEXT, quantity INTEGER,
+            fill_price REAL, commission REAL, realized_pnl REAL, status TEXT
+        );
+    """)
+    conn.execute(
+        "INSERT INTO executions (timestamp, run_date, symbol, event_type, action, "
+        "quantity, fill_price, commission, realized_pnl, status) VALUES "
+        "(?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?)",
+        ("2026-05-07T20:55:35+00:00", "2026-05-07", "MCL", "roll",
+         7, 62.20, 10.78, "Filled"),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM executions").fetchone()
+    assert _is_real_transaction(row) is False
+    conn.close()
+
+
 def test_row_to_transaction_handles_null_realized_pnl_pre_migration(tmp_path):
     """Rows logged before the migration have NULL realized_pnl. Reader must
     fall back to 0.0 (matching the old "always zero" behavior) rather than
