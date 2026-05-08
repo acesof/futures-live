@@ -306,7 +306,15 @@ def cmd_run_once(args):
                 error=rec.get("error"),
             )
 
-        # Update state
+        # Update state — RELOAD from disk before saving. order_manager.
+        # execute_rebalance() writes to executor_state.json mid-run (e.g.,
+        # roll's set_active_contract → save_executor_state). Our local
+        # `state` dict was loaded at function start (line ~83) and does
+        # NOT see those mid-run on-disk updates. Saving the local state
+        # would silently overwrite the roll's active_contracts update —
+        # exactly the bug observed 2026-05-08 (executor sold MCLM6 to
+        # close a position that yesterday's roll had moved to MCLN6).
+        state = _load_state()
         state["last_run_date"] = today
         _save_state(state)
 
