@@ -472,14 +472,20 @@ class OrderManager:
 
             sz = sizing.get(symbol)
 
+            # Defense-in-depth: when correcting an existing position, use
+            # the position-holding contract (not pair.front).
+            corr_contract, corr_src = self._resolve_close_contract(symbol, pair)
+            corr_local = getattr(corr_contract, "localSymbol", "") or corr_contract.symbol
+
             logger.warning(
                 f"RECONCILE {symbol}: actual={actual_qty} target={target}, "
-                f"correcting {action} {qty}"
+                f"correcting {action} {qty} on {corr_local} "
+                f"(contract source: {corr_src})"
             )
 
             try:
                 trade = self.broker.place_market_order(
-                    pair.front.contract,
+                    corr_contract,
                     action,
                     qty,
                 )
@@ -625,22 +631,29 @@ class OrderManager:
         """Execute a position reversal: close current, then open new direction.
 
         Two separate orders to avoid partial fill issues on the reversal.
+        Step 1 (close) targets the contract that ACTUALLY HOLDS the
+        position (via ``_resolve_close_contract``). Step 2 (open new
+        direction) is a fresh open and uses ``pair.front`` (the
+        front-month picker), which is the right semantic for a new
+        open.
         """
         records = []
-        contract = pair.front.contract
 
-        # Step 1: Close existing position
+        # Step 1: Close existing position — use position-holding contract.
+        close_contract, close_src = self._resolve_close_contract(symbol, pair)
         close_action = "SELL" if delta.current_contracts > 0 else "BUY"
         close_qty = abs(delta.current_contracts)
+        close_local = getattr(close_contract, "localSymbol", "") or close_contract.symbol
 
         logger.info(
             f"{symbol}: reversal — closing {delta.current_contracts} "
-            f"({close_action} {close_qty})"
+            f"({close_action} {close_qty}) on {close_local} "
+            f"(contract source: {close_src})"
         )
 
         try:
             trade = self.broker.place_market_order(
-                contract,
+                close_contract,
                 close_action,
                 close_qty,
             )
@@ -671,7 +684,8 @@ class OrderManager:
             )
             return records  # Don't open new side if close failed
 
-        # Step 2: Open new direction
+        # Step 2: Open new direction — pair.front is correct for fresh opens.
+        open_contract = pair.front.contract
         open_action = "BUY" if delta.target_contracts > 0 else "SELL"
         open_qty = abs(delta.target_contracts)
 
@@ -680,12 +694,12 @@ class OrderManager:
 
         logger.info(
             f"{symbol}: reversal — opening {delta.target_contracts} "
-            f"({open_action} {open_qty})"
+            f"({open_action} {open_qty}) on {pair.front.local_symbol}"
         )
 
         try:
             trade = self.broker.place_market_order(
-                contract,
+                open_contract,
                 open_action,
                 open_qty,
             )
@@ -717,6 +731,75 @@ class OrderManager:
 
         return records
 
+    def _resolve_close_contract(
+        self,
+        symbol: str,
+        pair: ContractPair,
+    ) -> tuple["Contract", str]:
+        """Pick the contract for a close/reduce/reconcile order.
+
+        Defense-in-depth (task #214). The only safe contract for a close
+        or reduce is the one that ACTUALLY HOLDS the position. Falling
+        back to ``pair.front`` (front-month picker) silently opens new
+        positions if state.json drifts from broker truth — the
+        2026-05-08 incident's failure mode (cli.py state-overwrite bug
+        was the proximate cause; this function is the wear-belt-and-
+        suspenders backstop).
+
+        Returns ``(contract, source_label)`` where source_label is one
+        of:
+
+          - ``"position"``       single existing position matched, used
+                                 its ``con_id``
+          - ``"pair.front"``     no existing position (genuine new open)
+                                 OR qualifyContracts failed
+          - ``"pair.front+SPLIT"`` split state across 2+ contracts —
+                                 fell back to pair.front and logged loud
+                                 warning; operator must intervene
+        """
+        from ib_insync import Contract
+
+        all_positions = self.broker.get_positions()
+        matches = [
+            p for p in all_positions
+            if p.symbol == symbol and abs(p.position) > 0
+        ]
+
+        if len(matches) == 1:
+            pos = matches[0]
+            contract = Contract(conId=pos.con_id, exchange=pos.exchange or "")
+            qualified = self.broker.ib.qualifyContracts(contract)
+            if not qualified:
+                logger.error(
+                    f"{symbol}: failed to qualify conId={pos.con_id}; "
+                    f"falling back to pair.front ({pair.front.local_symbol})"
+                )
+                return pair.front.contract, "pair.front"
+            if pos.local_symbol != pair.front.local_symbol:
+                logger.warning(
+                    f"{symbol}: trading on {pos.local_symbol} "
+                    f"(pair.front would be {pair.front.local_symbol}) — "
+                    f"position-holding contract takes precedence to avoid "
+                    f"opening a wrong-contract leg"
+                )
+            return qualified[0], "position"
+
+        if len(matches) > 1:
+            legs = ", ".join(
+                f"{p.local_symbol}={p.position:+.0f}" for p in matches
+            )
+            logger.error(
+                f"{symbol}: SPLIT POSITION across {len(matches)} contracts "
+                f"({legs}) — this should not happen; investigate via "
+                f"`close_rogue_mcl_legs.py`-style cleanup. Falling back to "
+                f"pair.front ({pair.front.local_symbol}); the next order "
+                f"may worsen the split until manually resolved."
+            )
+            return pair.front.contract, "pair.front+SPLIT"
+
+        # No existing position → genuine new open; pair.front is correct.
+        return pair.front.contract, "pair.front"
+
     def _execute_adjustment(
         self,
         symbol: str,
@@ -724,14 +807,15 @@ class OrderManager:
         delta: PositionDelta,
     ) -> tuple[dict | None, "Trade | None"]:
         """Execute a simple position adjustment (increase or decrease)."""
-        contract = pair.front.contract
         action = delta.action
         qty = abs(delta.delta)
 
         if qty == 0:
             return None, None
 
-        logger.info(f"{symbol}: {action} {qty} contracts")
+        contract, source = self._resolve_close_contract(symbol, pair)
+        local = getattr(contract, "localSymbol", "") or contract.symbol
+        logger.info(f"{symbol}: {action} {qty} on {local} (contract source: {source})")
 
         try:
             trade = self.broker.place_market_order(contract, action, qty)
