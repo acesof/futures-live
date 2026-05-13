@@ -88,6 +88,36 @@ def cmd_run_once(args):
         notifier.notify_kill_switch()
         return 1
 
+    # Strategy integrity gate — refuse trading if any deployed strategy
+    # file fails its signed module_sha1 stamp. Mirror of the forex-live
+    # check; same root cause (2026-05-13 incident pattern). See
+    # PLAN_QUARANTINE_REDESIGN + RESILIENCE_REHEARSAL_RUNBOOK §F10.
+    # Runs BEFORE broker.connect() so we don't even touch IB Gateway
+    # when integrity is compromised.
+    from algo_research_factory.src.deployment.strategy_integrity import (
+        IntegrityError, verify_strategy_integrity,
+    )
+    strategies_yaml = CONFIG_DIR / "strategies.yaml"
+    try:
+        verify_strategy_integrity(strategies_yaml)
+    except IntegrityError as ie:
+        n = len(ie.failures)
+        first_three = "; ".join(
+            f"{f['type']}:{f['name']}" for f in ie.failures[:3]
+        )
+        more = f" (+{n-3} more)" if n > 3 else ""
+        signal_msg = (
+            f"FUTURES INTEGRITY REFUSED: {n} strategy file(s) drifted "
+            f"from export stamps: {first_three}{more}. Cycle skipped. "
+            f"See logs and run `portfolio export-live` to re-sign."
+        )
+        logger.error(f"Strategy integrity check FAILED:\n{ie}")
+        # Note: futures AuditLog has no `log_event` (forex pattern); the
+        # error is captured in the futures log file via logger.error above.
+        notifier.notify_error("INTEGRITY", signal_msg)
+        print(signal_msg)
+        return 1
+
     # Connect to IBKR
     broker = BrokerConnection(config.broker)
     try:
