@@ -108,6 +108,19 @@ class ContractResolver:
         front_exp, front_details = candidates[selected_idx]
         front = self._to_resolved(front_details, front_exp)
 
+        # [#228 tradability probe — TEMP] Verify IBKR populates trading-hours
+        # fields for the planned "skip-when-venue-closed" gate. Raw strings
+        # only (no parse → cannot throw). Read in tomorrow's log; remove once
+        # confirmed. tradingHours = full Globex session (what the gate needs);
+        # liquidHours = RTH only (would wrongly skip the 16:55 ET fire).
+        logger.info(
+            f"[tradability-probe #228] {instrument.symbol} "
+            f"{front_details.contract.localSymbol}: "
+            f"tz={front_details.timeZoneId!r} "
+            f"tradingHours={front_details.tradingHours!r} "
+            f"liquidHours={front_details.liquidHours!r}"
+        )
+
         # Next = following month after the selected front (if available)
         next_contract = None
         next_exp = None
