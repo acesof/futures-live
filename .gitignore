@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Runtime state — executor writes these every cron, never in remote
+audit.db
+audit.db.pre-onboard-*
+data/audit.db
+data/audit.db.pre-onboard-*
+data/executor_state.json
+data/executor_state.json.bak*
+data/reference_equity.json
+data/close_prices_*.json
+data/targets_*.json
+
+# Legacy data paths (pre-Option-2, deprecated 2026-05-05 — files removed,
+# dirs ignored so any stray re-creation doesn't resurface as untracked)
+data/bars/
+data/continuous/
+
+# Logs (daily cron output)
+logs/
+
+# Pre-re-export strategy backups (manual local safety copies)
+**/strategies.yaml.backup*
+
+# OS
+.DS_Store
