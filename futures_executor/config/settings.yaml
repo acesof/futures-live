@@ -27,7 +27,11 @@ instruments:
     portfolio_symbol: GC
     multiplier: 10.0       # $10 per point (Micro GC)
     margin: 800
-    delivery_buffer_days: 14
+    # 33 (was 14): COMEX gold's delivery/first-notice window opens ~30 cal days
+    # before expiry; IBKR rejects orders inside it (Error 201). Roll to next at
+    # ~33d so we're out before the window. MUST stay == R-factory
+    # instruments.yaml (GC) or sim/live roll at different times. See #228 review.
+    delivery_buffer_days: 33
 
 roll:
   days_before_expiry: 7
