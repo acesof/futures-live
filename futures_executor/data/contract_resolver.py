@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from ib_insync import IB, Contract, ContractDetails
 
@@ -37,6 +37,48 @@ class ContractPair:
     days_to_expiry: int  # trading days to front expiry
     roll_due: bool  # True if within roll window
     hard_deadline: bool  # True if within hard deadline
+    # [#228] False = venue closed at fire time → skip this run's rebalance
+    # (matches the sim's no-bar-on-holiday behavior). Default True so any
+    # legacy construction site that omits it falls through to current behavior.
+    tradable_now: bool = True
+
+
+def _compute_tradable_now(
+    details: ContractDetails,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Is ``details``'s contract in an open trading session right now?
+
+    Uses IBKR ``tradingHours`` (full Globex), not ``liquidHours`` (RTH).
+    ib_insync's ``tradingSessions()`` parses tradingHours into a list of
+    timezone-aware ``(start, end)`` segments, dropping ``CLOSED`` ranges.
+
+    Fail-OPEN on uncertainty (returns True if hours are empty or parsing
+    fails) so a missing/transient data condition does NOT cause us to
+    wrongly skip a real trading day. The gate's failure mode is "miss a
+    trade," never "place a wrong trade" — by design (#228).
+
+    ``now_utc`` lets tests inject a fixed instant; defaults to wall clock.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if not details.tradingHours:
+        return True  # no data → fail-open
+    try:
+        sessions = details.tradingSessions()
+    except Exception as e:
+        sym = getattr(getattr(details, "contract", None), "localSymbol", "?")
+        logger.warning(
+            f"tradability parse failed for {sym}: {e}; "
+            f"defaulting to tradable_now=True"
+        )
+        return True
+    if not sessions:
+        # Populated tradingHours but every segment was CLOSED → genuinely closed.
+        return False
+    tz = sessions[0].start.tzinfo
+    now_local = now_utc.astimezone(tz)
+    return any(s.start <= now_local <= s.end for s in sessions)
 
 
 class ContractResolver:
@@ -168,12 +210,18 @@ class ContractResolver:
         roll_due = trading_days <= self.roll_config.days_before_expiry
         hard_deadline = trading_days <= self.roll_config.hard_deadline_days
 
+        # [#228] Tradability gate: is the venue open NOW for this contract?
+        # Drives the per-instrument skip in order_manager.execute_rebalance.
+        # Fail-OPEN — see _compute_tradable_now docstring.
+        tradable_now = _compute_tradable_now(front_details)
+
         logger.info(
             f"{instrument.symbol}: front={front.local_symbol} "
             f"(exp={front.expiry}, {trading_days}d), "
             f"next={next_contract.local_symbol if next_contract else 'N/A'}"
             f"{' [ROLL DUE]' if roll_due else ''}"
             f"{' [HARD DEADLINE]' if hard_deadline else ''}"
+            f"{' [NOT TRADABLE]' if not tradable_now else ''}"
         )
 
         return ContractPair(
@@ -183,6 +231,7 @@ class ContractResolver:
             days_to_expiry=trading_days,
             roll_due=roll_due,
             hard_deadline=hard_deadline,
+            tradable_now=tradable_now,
         )
 
     def resolve_all(

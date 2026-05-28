@@ -269,6 +269,28 @@ class OrderManager:
                 logger.warning(f"{symbol}: no contract pair, skipping")
                 continue
 
+            # [#228] Tradability gate: if the venue is closed at fire time
+            # (holiday / early-close / out-of-session), do NOT rebalance.
+            # The backtest has no daily bar for closed venues so the sim
+            # doesn't rebalance either — live must match. Skipping here
+            # also keeps the symbol out of sizing → deltas → placement →
+            # reconcile (reconcile only iterates target_contracts, which
+            # is built from `sizing`). So no queued order, no orphan, no
+            # reconcile_failed CRITICAL — Memorial-Day failure mode dies.
+            if not pair.tradable_now:
+                logger.warning(
+                    f"{symbol}: venue closed at fire time "
+                    f"(target_signal={signal:+.6f}); skipping rebalance "
+                    f"— sim has no bar on this day either."
+                )
+                records.append({
+                    "type": "venue_closed_skip",
+                    "symbol": symbol,
+                    "target_signal": float(signal),
+                    "status": "SKIPPED",
+                })
+                continue
+
             last_price = self._get_last_price(pair)
             if last_price <= 0:
                 logger.warning(f"{symbol}: invalid last price {last_price}, skipping")
