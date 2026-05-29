@@ -122,6 +122,26 @@ class SignalNotifier:
                     lines.append(
                         f"  ROLL {symbol}: {from_m} -> {to_m}, qty={qty} -> {status}"
                     )
+                elif event_type == "migration_roll":
+                    from_m = rec.get("from_month", "?")
+                    to_m = rec.get("to_month", "?")
+                    qty = rec.get("quantity", "?")
+                    lines.append(
+                        f"  MIGRATION-ROLL {symbol}: {from_m} -> {to_m}, "
+                        f"qty={qty} -> {status} (buffer-triggered)"
+                    )
+                elif event_type == "migration_blocked":
+                    error = rec.get("error", "blocked")
+                    lines.append(
+                        f"  MIGRATION-BLOCKED {symbol}: {error} -> {status}"
+                    )
+                elif event_type == "contract_advance":
+                    from_m = rec.get("from_month", "?")
+                    to_m = rec.get("to_month", "?")
+                    lines.append(
+                        f"  CONTRACT-ADVANCE {symbol}: {from_m} -> {to_m} "
+                        "(delivery buffer; no migration needed)"
+                    )
                 elif event_type in ("reconcile_error", "reconcile_failed"):
                     error = rec.get("error", "unknown")
                     lines.append(f"  {event_type.upper()}: {error} -> {status}")
@@ -165,12 +185,34 @@ class SignalNotifier:
         to_month: str,
         quantity: int,
         status: str,
+        kind: str = "ROLL",
     ) -> bool:
-        """Send roll notification."""
+        """Send roll notification. ``kind`` lets callers distinguish a
+        scheduled ROLL from a buffer-triggered MIGRATION-ROLL in the
+        Signal subject without forking the method."""
         msg = (
-            f"{EMOJI_ROLL} ROLL: {symbol}\n"
+            f"{EMOJI_ROLL} {kind}: {symbol}\n"
             f"{from_month} -> {to_month}\n"
             f"Qty: {quantity}, Status: {status}"
+        )
+        return self.send(msg)
+
+    def notify_contract_advance(
+        self,
+        symbol: str,
+        from_month: str,
+        to_month: str,
+        reason: str = "delivery_buffer",
+    ) -> bool:
+        """Signal that resolve() advanced the front contract pointer
+        (e.g., delivery_buffer fired). Distinct from notify_roll — no
+        position was migrated; only the system's idea of "the front"
+        moved. Pair with notify_roll if a stranded position also got
+        migrated this run."""
+        msg = (
+            f"{EMOJI_ROLL} CONTRACT-ADVANCE: {symbol}\n"
+            f"{from_month} -> {to_month}\n"
+            f"Reason: {reason} (no position migration this run)"
         )
         return self.send(msg)
 

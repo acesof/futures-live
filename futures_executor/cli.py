@@ -175,6 +175,41 @@ def cmd_run_once(args):
             logger.critical("No contracts resolved")
             return 1
 
+        # [#228] Emit Signal + audit + state-update for every buffer-
+        # advance the resolver performed this run. Without this, the
+        # contract pointer changes silently. If a position is also held
+        # on the abandoned contract, the migration runs later via
+        # OrderManager.migrate_stranded_positions and emits a *separate*
+        # migration_roll record + Signal — distinct events, both worth
+        # knowing. Update active_contracts so next run's resolver picks
+        # up the new front (buffer_advanced_from will be None then,
+        # closing the re-fire loop).
+        for symbol, pair in contract_pairs.items():
+            if pair.buffer_advanced_from is None:
+                continue
+            from_m = pair.buffer_advanced_from
+            to_m = pair.front.expiry_str
+            logger.warning(
+                f"{symbol}: contract pointer advanced {from_m} -> {to_m} "
+                "(delivery buffer); emitting Signal + audit + state update."
+            )
+            notifier.notify_contract_advance(
+                symbol=symbol, from_month=from_m, to_month=to_m,
+                reason="delivery_buffer",
+            )
+            audit.log_execution(
+                run_date=today, symbol=symbol,
+                event_type="contract_advance",
+                status="ADVANCED",
+                details={
+                    "from_month": from_m,
+                    "to_month": to_m,
+                    "reason": "delivery_buffer",
+                },
+            )
+            state = set_active_contract(state, symbol, to_m)
+            save_executor_state(state)
+
         # Daily evaluation — thresholds decide whether to trade
         order_mgr = OrderManager(broker, config)
 
@@ -305,7 +340,7 @@ def cmd_run_once(args):
                     rec.get("symbol", "?"),
                     rec.get("error", "unknown error"),
                 )
-            elif event_type == "roll":
+            elif event_type in ("roll", "migration_roll"):
                 n_rolls += 1
                 notifier.notify_roll(
                     rec["symbol"],
@@ -313,6 +348,8 @@ def cmd_run_once(args):
                     rec.get("to_month", ""),
                     rec.get("quantity", 0),
                     status,
+                    kind=("MIGRATION-ROLL" if event_type == "migration_roll"
+                          else "ROLL"),
                 )
             elif event_type in ("adjustment", "close", "open", "reconcile"):
                 n_orders += 1

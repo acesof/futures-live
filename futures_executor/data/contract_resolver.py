@@ -41,6 +41,12 @@ class ContractPair:
     # (matches the sim's no-bar-on-holiday behavior). Default True so any
     # legacy construction site that omits it falls through to current behavior.
     tradable_now: bool = True
+    # Set by resolve() when delivery_buffer_days fires and `front` is
+    # advanced to `next_contract`. Carries the `expiry_str` of the
+    # ABANDONED contract so cli.py can emit a Signal + audit row + state
+    # update for the pointer change, and order_manager can detect/migrate
+    # any stranded position on it. None = no advance this resolve().
+    buffer_advanced_from: str | None = None
 
 
 def _compute_tradable_now(
@@ -173,11 +179,15 @@ class ContractResolver:
         # Delivery buffer: if front is inside IBKR's delivery window,
         # skip to next contract to avoid order rejections (error 201).
         cal_days_front = (front_exp - today).days
+        buffer_advanced_from: str | None = None
         if (
             instrument.delivery_buffer_days > 0
             and cal_days_front <= instrument.delivery_buffer_days
             and next_contract is not None
         ):
+            # Capture the ABANDONED contract before the pointer swap so the
+            # caller can Signal/audit + detect any stranded position on it.
+            buffer_advanced_from = front.expiry_str
             logger.info(
                 f"{instrument.symbol}: front {front.local_symbol} inside "
                 f"delivery buffer ({cal_days_front}d <= "
@@ -232,6 +242,7 @@ class ContractResolver:
             roll_due=roll_due,
             hard_deadline=hard_deadline,
             tradable_now=tradable_now,
+            buffer_advanced_from=buffer_advanced_from,
         )
 
     def resolve_all(

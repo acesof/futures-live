@@ -8,8 +8,10 @@ Both V1 and V2 produce sized positions, so sizing is unified.
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime as _dt
 
 import numpy as np
+from ib_insync import Contract as _IBContract
 
 from futures_executor.config.loader import (
     ExecutionSettings,
@@ -17,7 +19,7 @@ from futures_executor.config.loader import (
     InstrumentSettings,
     SafetySettings,
 )
-from futures_executor.data.contract_resolver import ContractPair
+from futures_executor.data.contract_resolver import ContractPair, ResolvedContract
 from futures_executor.execution.broker import BrokerConnection, BrokerPosition
 from futures_executor.state import (
     load_executor_state,
@@ -253,13 +255,28 @@ class OrderManager:
         Returns list of dicts with execution details for audit logging.
         """
         all_positions = self.broker.get_positions()
+
+        # [#228] Migrate any position held on a contract != pair.front
+        # (the buffer-advance gap) BEFORE Step 1 sizing. The scheduled-
+        # roll path can't see these because compute_position_diff is
+        # symbol-aggregated and the roll's front_qty check looks at the
+        # NEW front. Without this, a position carried into the buffer
+        # window strands silently. Failed migrations populate
+        # skip_symbols so the rest of this method excludes them.
+        migration_records, skip_symbols = self.migrate_stranded_positions(
+            contract_pairs, all_positions,
+        )
+        records: list[dict] = list(migration_records)
+        if migration_records:
+            # Re-fetch so the aggregation below sees post-migration truth.
+            all_positions = self.broker.get_positions()
+
         current_positions: dict[str, BrokerPosition] = {}
         for pos in all_positions:
             if pos.symbol in current_positions:
                 current_positions[pos.symbol].position += pos.position
             else:
                 current_positions[pos.symbol] = pos
-        records = []
 
         # Step 1: Size each instrument
         sizing: dict[str, SizingResult] = {}
@@ -267,6 +284,16 @@ class OrderManager:
             pair = contract_pairs.get(symbol)
             if pair is None:
                 logger.warning(f"{symbol}: no contract pair, skipping")
+                continue
+
+            # [#228] If migrate_stranded_positions failed/blocked for this
+            # symbol, exclude it from sizing → deltas → placement →
+            # reconcile (same semantics as the venue-closed-skip below).
+            if symbol in skip_symbols:
+                logger.warning(
+                    f"{symbol}: skipped — stranded-position migration "
+                    "failed or was blocked; will retry next run."
+                )
                 continue
 
             # [#228] Tradability gate: if the venue is closed at fire time
@@ -583,6 +610,170 @@ class OrderManager:
                 logger.info("Final verification: all positions correct")
 
         return records
+
+    def migrate_stranded_positions(
+        self,
+        contract_pairs: dict[str, ContractPair],
+        all_positions: list[BrokerPosition],
+    ) -> tuple[list[dict], set[str]]:
+        """Auto-migrate positions stranded on a contract != pair.front.
+
+        Triggered by the `delivery_buffer_days` advance in
+        ``contract_resolver.resolve()``: when the resolver swaps
+        ``pair.front`` to the next contract, any existing position on
+        the abandoned contract is invisible to ``compute_position_diff``
+        (symbol-aggregated) and the scheduled-roll path (which checks
+        ``front_qty`` on the NEW front). Without this method, those
+        positions strand silently. (#228)
+
+        For each stranded position, builds a synthetic ContractPair
+        ``(front=stranded, next=pair.front)`` and runs the existing
+        ``_execute_roll`` calendar-spread machinery. On Fill, updates
+        ``active_contracts`` state. On failure, adds the symbol to
+        ``skip_symbols`` so the rest of ``execute_rebalance`` excludes
+        it from sizing/reconcile — preserves the miss-trade risk class
+        (a failed migration emits Signal + audit, no further order
+        placement on the still-stranded symbol).
+
+        Returns ``(records, skip_symbols)``.
+        """
+        records: list[dict] = []
+        skip: set[str] = set()
+
+        for symbol, pair in contract_pairs.items():
+            front_expiry = pair.front.expiry_str
+            stranded = [
+                p for p in all_positions
+                if p.symbol == symbol
+                and p.position != 0
+                and p.contract_month
+                and p.contract_month != front_expiry
+            ]
+            for sp in stranded:
+                # Qualify the stranded contract — mirror of the pattern
+                # in ``_resolve_close_contract`` (we need a real qualified
+                # ``Contract`` for the BAG-combo close leg).
+                try:
+                    qualified = self.broker.ib.qualifyContracts(
+                        _IBContract(conId=sp.con_id, exchange=sp.exchange)
+                    )
+                except Exception as e:
+                    logger.critical(
+                        f"{symbol}: qualifyContracts raised for stranded "
+                        f"con_id={sp.con_id}: {e}"
+                    )
+                    qualified = []
+                if not qualified:
+                    msg = (
+                        f"qualifyContracts failed for stranded "
+                        f"{sp.local_symbol} (con_id={sp.con_id})"
+                    )
+                    logger.critical(f"{symbol}: {msg}")
+                    records.append({
+                        "type": "migration_blocked",
+                        "symbol": symbol,
+                        "from_month": sp.contract_month,
+                        "to_month": pair.front.expiry_str,
+                        "error": msg,
+                        "status": "FAILED",
+                    })
+                    skip.add(symbol)
+                    continue
+
+                # Parse stranded expiry_str into a ``date`` (same logic
+                # as ``contract_resolver._to_resolved`` parsing).
+                try:
+                    if len(sp.contract_month) == 8:
+                        stranded_exp = _dt.strptime(
+                            sp.contract_month, "%Y%m%d"
+                        ).date()
+                    else:
+                        stranded_exp = _dt.strptime(
+                            sp.contract_month, "%Y%m"
+                        ).date()
+                except ValueError:
+                    msg = f"could not parse contract_month={sp.contract_month!r}"
+                    logger.critical(f"{symbol}: {msg}")
+                    records.append({
+                        "type": "migration_blocked",
+                        "symbol": symbol,
+                        "from_month": sp.contract_month,
+                        "to_month": pair.front.expiry_str,
+                        "error": msg,
+                        "status": "FAILED",
+                    })
+                    skip.add(symbol)
+                    continue
+
+                stranded_resolved = ResolvedContract(
+                    symbol=sp.symbol,
+                    con_id=sp.con_id,
+                    exchange=sp.exchange,
+                    currency=pair.front.currency,
+                    expiry=stranded_exp,
+                    expiry_str=sp.contract_month,
+                    multiplier=sp.multiplier,
+                    local_symbol=sp.local_symbol,
+                    min_tick=pair.front.min_tick,
+                    contract=qualified[0],
+                )
+
+                # Synthetic pair: front = stranded (close leg of the
+                # BAG combo), next = current pair.front (open leg = the
+                # migration target).
+                synthetic = ContractPair(
+                    symbol=symbol,
+                    front=stranded_resolved,
+                    next=pair.front,
+                    days_to_expiry=0,
+                    roll_due=True,
+                    hard_deadline=True,
+                    tradable_now=pair.tradable_now,
+                )
+
+                logger.warning(
+                    f"{symbol}: STRANDED position on {sp.local_symbol} "
+                    f"(qty={int(sp.position)}); migrating to "
+                    f"{pair.front.local_symbol} via calendar spread."
+                )
+                record, _trade = self._execute_roll(
+                    symbol, synthetic, current_qty=int(sp.position),
+                )
+
+                if record is None:
+                    msg = "_execute_roll returned None (no next contract)"
+                    logger.critical(f"{symbol}: {msg}")
+                    records.append({
+                        "type": "migration_blocked",
+                        "symbol": symbol,
+                        "from_month": sp.contract_month,
+                        "to_month": pair.front.expiry_str,
+                        "error": msg,
+                        "status": "FAILED",
+                    })
+                    skip.add(symbol)
+                    continue
+
+                # Reclassify so cli.py / notifier / audit can distinguish
+                # the buffer-triggered migration from a scheduled roll.
+                record["type"] = "migration_roll"
+                records.append(record)
+
+                if record.get("status") == "Filled":
+                    state = load_executor_state()
+                    state = set_active_contract(
+                        state, symbol, pair.front.expiry_str,
+                    )
+                    save_executor_state(state)
+                else:
+                    logger.error(
+                        f"{symbol}: migration_roll did not fill "
+                        f"(status={record.get('status')}); excluding "
+                        "from subsequent sizing."
+                    )
+                    skip.add(symbol)
+
+        return records, skip
 
     def _execute_roll(
         self,
