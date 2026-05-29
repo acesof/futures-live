@@ -39,20 +39,29 @@ def _details(hours: str, tz: str) -> ContractDetails:
 
 def test_normal_fire_time_all_tradable():
     """20:55 UTC weekday = 16:55 ET = 15:55 CT — the actual cron fire.
-    Inside every instrument's session → all three must say tradable."""
+    Inside every instrument's session → all three must say tradable
+    AND must surface a current_session_end (so the Step 6 cancel
+    path has a re-check timestamp to use)."""
     fire = datetime(2026, 5, 28, 20, 55, tzinfo=timezone.utc)
-    assert _compute_tradable_now(_details(MCL_HOURS, MCL_TZ), fire) is True
-    assert _compute_tradable_now(_details(MES_HOURS, MES_TZ), fire) is True
-    assert _compute_tradable_now(_details(MGC_HOURS, MGC_TZ), fire) is True
+    mcl_open, mcl_end = _compute_tradable_now(_details(MCL_HOURS, MCL_TZ), fire)
+    mes_open, mes_end = _compute_tradable_now(_details(MES_HOURS, MES_TZ), fire)
+    mgc_open, mgc_end = _compute_tradable_now(_details(MGC_HOURS, MGC_TZ), fire)
+    assert mcl_open is True and mes_open is True and mgc_open is True
+    # Session-end must be in the future relative to fire time.
+    assert mcl_end is not None and mcl_end > fire.astimezone(mcl_end.tzinfo)
+    assert mes_end is not None and mes_end > fire.astimezone(mes_end.tzinfo)
+    assert mgc_end is not None and mgc_end > fire.astimezone(mgc_end.tzinfo)
 
 
 def test_daily_halt_all_closed():
     """21:30 UTC = 17:30 ET = 16:30 CT — squarely inside the 17:00-18:00 ET
-    Globex daily halt. None of the three is in any session → all False."""
+    Globex daily halt. None of the three is in any session → all False,
+    session_end None."""
     halt = datetime(2026, 5, 28, 21, 30, tzinfo=timezone.utc)
-    assert _compute_tradable_now(_details(MCL_HOURS, MCL_TZ), halt) is False
-    assert _compute_tradable_now(_details(MES_HOURS, MES_TZ), halt) is False
-    assert _compute_tradable_now(_details(MGC_HOURS, MGC_TZ), halt) is False
+    for hours, tz in [(MCL_HOURS, MCL_TZ), (MES_HOURS, MES_TZ), (MGC_HOURS, MGC_TZ)]:
+        open_, end_ = _compute_tradable_now(_details(hours, tz), halt)
+        assert open_ is False
+        assert end_ is None
 
 
 def test_saturday_all_closed():
@@ -60,23 +69,33 @@ def test_saturday_all_closed():
     parser and no other date's session covers Sat noon → not tradable.
     This is the *Memorial-Day-class* signal the gate exists to honor."""
     sat = datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc)
-    assert _compute_tradable_now(_details(MCL_HOURS, MCL_TZ), sat) is False
-    assert _compute_tradable_now(_details(MES_HOURS, MES_TZ), sat) is False
-    assert _compute_tradable_now(_details(MGC_HOURS, MGC_TZ), sat) is False
+    for hours, tz in [(MCL_HOURS, MCL_TZ), (MES_HOURS, MES_TZ), (MGC_HOURS, MGC_TZ)]:
+        open_, end_ = _compute_tradable_now(_details(hours, tz), sat)
+        assert open_ is False
+        assert end_ is None
 
 
 def test_empty_hours_fails_open():
     """No tradingHours data = uncertainty. Gate MUST fail OPEN
     (return True) — its design rule is "miss a trade, never place a
-    wrong trade." A transient empty would otherwise silently kill a
-    real trading day's rebalance."""
+    wrong trade." session_end is None (fail-OPEN on the cancel side
+    too — Step 6 won't cancel)."""
     fire = datetime(2026, 5, 28, 20, 55, tzinfo=timezone.utc)
-    assert _compute_tradable_now(_details("", "US/Eastern"), fire) is True
+    open_, end_ = _compute_tradable_now(_details("", "US/Eastern"), fire)
+    assert open_ is True
+    assert end_ is None
 
 
 def test_session_edge_minute_before_close():
     """20:59 UTC = 16:59 ET — exactly one minute before MCL/MGC's 17:00 ET
-    close. Should still be tradable (inclusive at the session end)."""
+    close. Should still be tradable (inclusive at the session end), and
+    session_end should equal the imminent 17:00 ET boundary."""
     near_close = datetime(2026, 5, 28, 20, 59, tzinfo=timezone.utc)
-    assert _compute_tradable_now(_details(MCL_HOURS, MCL_TZ), near_close) is True
-    assert _compute_tradable_now(_details(MGC_HOURS, MGC_TZ), near_close) is True
+    mcl_open, mcl_end = _compute_tradable_now(_details(MCL_HOURS, MCL_TZ), near_close)
+    mgc_open, mgc_end = _compute_tradable_now(_details(MGC_HOURS, MGC_TZ), near_close)
+    assert mcl_open is True and mgc_open is True
+    assert mcl_end is not None and mgc_end is not None
+    # MCL/MGC session ends 17:00 ET (= 21:00 UTC). One minute after
+    # near_close at most.
+    delta_mcl = mcl_end.astimezone(timezone.utc) - near_close
+    assert 0 <= delta_mcl.total_seconds() <= 120

@@ -8,7 +8,7 @@ Both V1 and V2 produce sized positions, so sizing is unified.
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime as _dt
+from datetime import datetime as _dt, timezone as _tz
 
 import numpy as np
 from ib_insync import Contract as _IBContract
@@ -453,33 +453,86 @@ class OrderManager:
                 if trade and not trade.isDone():
                     pending_trades.append((symbol, trade))
 
-        # Step 6: Cancel unfilled orders
+        # Step 6: Venue-state-conditioned cancel (#228 A2)
+        # On an OPEN venue a working market order will fill ASAP — cancelling
+        # it would defeat the goal. Only cancel when the venue has closed
+        # (would otherwise orphan-fill at reopen, the Memorial-Day failure
+        # mode). Track symbols left with working orders in
+        # `pending_at_disconnect` so the subsequent reconcile() skips them
+        # (avoids issuing a corrective order while the original is still in
+        # flight → double-fill).
+        pending_at_disconnect: set[str] = set()
         for symbol, trade in pending_trades:
-            if not trade.isDone():
+            if trade.isDone():
+                continue
+            pair = contract_pairs.get(symbol)
+            if pair is not None and self._venue_still_open(pair):
+                logger.info(
+                    f"{symbol}: order {trade.order.orderId} unfilled in "
+                    f"window (status={trade.orderStatus.status}); venue "
+                    "still open — leaving working (it will fill at the "
+                    "venue; next run reconciles to broker truth)."
+                )
+                pending_at_disconnect.add(symbol)
+            else:
                 logger.warning(
-                    f"{symbol}: order {trade.order.orderId} not filled "
-                    f"(status={trade.orderStatus.status}), cancelling"
+                    f"{symbol}: order {trade.order.orderId} unfilled "
+                    f"(status={trade.orderStatus.status}) and venue "
+                    "closed/halted — cancelling to prevent orphan-fill "
+                    "at reopen."
                 )
                 self.broker.cancel_order(trade)
 
-        # Step 7: Reconcile — re-read positions vs targets
+        # Step 7: Reconcile — re-read positions vs targets. Symbols whose
+        # original orders are still working on an open venue are skipped
+        # so reconcile doesn't double-place corrective orders.
         reconcile_records = self._reconcile(
             target_contracts,
             contract_pairs,
             sizing,
+            pending_at_disconnect=pending_at_disconnect,
         )
         records.extend(reconcile_records)
 
         return records
+
+    def _venue_still_open(
+        self,
+        pair: ContractPair,
+        now_utc: "_dt | None" = None,
+    ) -> bool:
+        """Re-check at cancel time whether the venue is still inside an
+        open trading session (#228 A2). Uses ``pair.current_session_end``
+        stamped at resolve() time so no IBKR round-trip is needed mid-run.
+
+        Fails OPEN (returns True → "don't cancel") when session info is
+        missing, matching the gate's design rule (miss-trade-not-wrong-
+        trade). A wrongful "still open" here just means a working order
+        is left to fill on the venue — the next run reconciles against
+        broker truth.
+        """
+        if pair.current_session_end is None:
+            return True
+        if now_utc is None:
+            now_utc = _dt.now(_tz.utc)
+        now_local = now_utc.astimezone(pair.current_session_end.tzinfo)
+        return now_local <= pair.current_session_end
 
     def _reconcile(
         self,
         target_contracts: dict[str, int],
         contract_pairs: dict[str, ContractPair],
         sizing: dict[str, SizingResult],
+        pending_at_disconnect: set[str] | None = None,
     ) -> list[dict]:
-        """Re-read positions, place corrective orders for any mismatches."""
+        """Re-read positions, place corrective orders for any mismatches.
+
+        ``pending_at_disconnect`` (#228 A2): symbols whose original Step 5
+        orders were left working on an open venue (Step 6 chose not to
+        cancel them). Skip these — issuing a corrective order while the
+        original is still in flight would double-fill once both land."""
         records = []
+        pending_at_disconnect = pending_at_disconnect or set()
 
         # Reconnect if needed
         if not self.broker.is_connected:
@@ -498,6 +551,12 @@ class OrderManager:
 
         mismatches = []
         for symbol, target in target_contracts.items():
+            if symbol in pending_at_disconnect:
+                logger.info(
+                    f"{symbol}: skipping reconcile — original order still "
+                    "working on open venue (will fill there)."
+                )
+                continue
             actual = actual_positions.get(symbol)
             actual_qty = int(actual.position) if actual else 0
             if actual_qty != target:

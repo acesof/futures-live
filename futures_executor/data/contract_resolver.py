@@ -47,29 +47,46 @@ class ContractPair:
     # update for the pointer change, and order_manager can detect/migrate
     # any stranded position on it. None = no advance this resolve().
     buffer_advanced_from: str | None = None
+    # [#228 A2] End of the current open trading session, captured at
+    # resolve() time. `order_manager.Step 6` uses it to re-check
+    # tradability when deciding whether to cancel an unfilled order
+    # (venue still open → leave it working; closed → cancel to prevent
+    # orphan-fill at reopen). None = fail-OPEN fallback (treat as still
+    # open; do NOT cancel — matches the gate's failure mode of "miss a
+    # trade" rather than "place a wrong trade").
+    current_session_end: datetime | None = None
 
 
 def _compute_tradable_now(
     details: ContractDetails,
     now_utc: datetime | None = None,
-) -> bool:
-    """Is ``details``'s contract in an open trading session right now?
+) -> tuple[bool, datetime | None]:
+    """Is ``details``'s contract in an open trading session right now,
+    and (if so) when does that session end?
+
+    Returns ``(is_tradable_now, current_session_end)``:
+      - ``is_tradable_now`` drives the Step 1 place-gate (#228 A1).
+      - ``current_session_end`` lets ``order_manager.Step 6`` re-check
+        tradability at cancel time without re-parsing tradingHours
+        mid-run (#228 A2 venue-state-conditioned cancel).
 
     Uses IBKR ``tradingHours`` (full Globex), not ``liquidHours`` (RTH).
     ib_insync's ``tradingSessions()`` parses tradingHours into a list of
     timezone-aware ``(start, end)`` segments, dropping ``CLOSED`` ranges.
 
-    Fail-OPEN on uncertainty (returns True if hours are empty or parsing
-    fails) so a missing/transient data condition does NOT cause us to
-    wrongly skip a real trading day. The gate's failure mode is "miss a
-    trade," never "place a wrong trade" — by design (#228).
+    Fail-OPEN on uncertainty (returns ``(True, None)`` if hours are empty
+    or parsing fails) so a missing/transient data condition does NOT
+    cause us to wrongly skip a real trading day. The gate's failure mode
+    is "miss a trade," never "place a wrong trade" — by design (#228).
+    ``current_session_end=None`` likewise means the cancel path will
+    fail-OPEN (no cancel) in Step 6.
 
     ``now_utc`` lets tests inject a fixed instant; defaults to wall clock.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     if not details.tradingHours:
-        return True  # no data → fail-open
+        return True, None  # no data → fail-open
     try:
         sessions = details.tradingSessions()
     except Exception as e:
@@ -78,13 +95,16 @@ def _compute_tradable_now(
             f"tradability parse failed for {sym}: {e}; "
             f"defaulting to tradable_now=True"
         )
-        return True
+        return True, None
     if not sessions:
         # Populated tradingHours but every segment was CLOSED → genuinely closed.
-        return False
+        return False, None
     tz = sessions[0].start.tzinfo
     now_local = now_utc.astimezone(tz)
-    return any(s.start <= now_local <= s.end for s in sessions)
+    for s in sessions:
+        if s.start <= now_local <= s.end:
+            return True, s.end
+    return False, None
 
 
 class ContractResolver:
@@ -207,10 +227,12 @@ class ContractResolver:
         roll_due = trading_days <= self.roll_config.days_before_expiry
         hard_deadline = trading_days <= self.roll_config.hard_deadline_days
 
-        # [#228] Tradability gate: is the venue open NOW for this contract?
-        # Drives the per-instrument skip in order_manager.execute_rebalance.
-        # Fail-OPEN — see _compute_tradable_now docstring.
-        tradable_now = _compute_tradable_now(front_details)
+        # [#228] Tradability gate: is the venue open NOW for this contract,
+        # and (if so) when does the current session end? Drives the per-
+        # instrument skip in order_manager.execute_rebalance (A1) AND the
+        # venue-state-conditioned cancel in Step 6 (A2). Fail-OPEN — see
+        # _compute_tradable_now docstring.
+        tradable_now, current_session_end = _compute_tradable_now(front_details)
 
         logger.info(
             f"{instrument.symbol}: front={front.local_symbol} "
@@ -230,6 +252,7 @@ class ContractResolver:
             hard_deadline=hard_deadline,
             tradable_now=tradable_now,
             buffer_advanced_from=buffer_advanced_from,
+            current_session_end=current_session_end,
         )
 
     def resolve_all(
