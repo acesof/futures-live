@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from futures_executor.execution.broker import _aggregate_fills_by_perm_id
 from futures_executor.monitoring.audit import AuditLog
 
 
@@ -271,6 +272,143 @@ def test_reconciler_distinguishes_multiple_perm_ids(audit):
         (222, "MGC", "adjustment",         "Filled"),
         (333, "MCL", "late_fill_orphan",   "Filled"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# get_last_run_timestamp helper
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Partial-fill aggregation (#228 A2 #4 trade-safety W1)
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_fills_single_perm_id_passthrough():
+    """A single fill (no partials) passes through unchanged."""
+    inp = [_ex(perm_id=1234567, fill_price=7544.25, quantity=4, commission=2.48)]
+    out = _aggregate_fills_by_perm_id(inp)
+    assert len(out) == 1
+    assert out[0] == inp[0]
+
+
+def test_aggregate_fills_multiple_partials_vwap_and_sums():
+    """3 partials with same perm_id → 1 entry with VWAP price + summed everything."""
+    partials = [
+        {
+            "perm_id": 1234567, "exec_id": "exec-A", "symbol": "MCL",
+            "action": "SELL", "quantity": 1, "fill_price": 92.37,
+            "commission": 0.77, "realized_pnl": 447.46,
+            "time_iso": "2026-06-01T20:55:23.574+00:00",
+        },
+        {
+            "perm_id": 1234567, "exec_id": "exec-B", "symbol": "MCL",
+            "action": "SELL", "quantity": 2, "fill_price": 92.33,
+            "commission": 1.54, "realized_pnl": 886.92,
+            "time_iso": "2026-06-01T20:55:23.580+00:00",
+        },
+        {
+            "perm_id": 1234567, "exec_id": "exec-C", "symbol": "MCL",
+            "action": "SELL", "quantity": 1, "fill_price": 92.33,
+            "commission": 0.77, "realized_pnl": 443.46,
+            "time_iso": "2026-06-01T20:55:23.583+00:00",
+        },
+    ]
+    out = _aggregate_fills_by_perm_id(partials)
+    assert len(out) == 1
+    agg = out[0]
+    assert agg["perm_id"] == 1234567
+    assert agg["quantity"] == 4
+    expected_vwap = (1*92.37 + 2*92.33 + 1*92.33) / 4
+    assert agg["fill_price"] == pytest.approx(expected_vwap)
+    assert agg["commission"] == pytest.approx(0.77 + 1.54 + 0.77)
+    assert agg["realized_pnl"] == pytest.approx(447.46 + 886.92 + 443.46)
+    # Representative exec_id and latest time.
+    assert agg["exec_id"] == "exec-A"
+    assert agg["time_iso"] == "2026-06-01T20:55:23.583+00:00"
+    # Symbol/action preserved.
+    assert agg["symbol"] == "MCL"
+    assert agg["action"] == "SELL"
+
+
+def test_aggregate_fills_distinct_perm_ids_kept_separate():
+    """Fills with different perm_ids are kept as separate entries."""
+    fills = [
+        _ex(perm_id=111, exec_id="a", symbol="MES", quantity=2,
+            fill_price=7544.0, commission=1.2),
+        _ex(perm_id=222, exec_id="b", symbol="MCL", quantity=4,
+            fill_price=92.5, commission=2.0),
+    ]
+    out = _aggregate_fills_by_perm_id(fills)
+    assert len(out) == 2
+    by_pid = {e["perm_id"]: e for e in out}
+    assert by_pid[111]["symbol"] == "MES" and by_pid[111]["quantity"] == 2
+    assert by_pid[222]["symbol"] == "MCL" and by_pid[222]["quantity"] == 4
+
+
+def test_aggregate_fills_perm_id_zero_or_none_treated_as_orphan_passthrough():
+    """``perm_id`` of 0 or None bypasses aggregation — each is an independent
+    orphan (no meaningful correlation key)."""
+    fills = [
+        _ex(perm_id=0, exec_id="orphan-a", symbol="MES", quantity=1),
+        _ex(perm_id=None, exec_id="orphan-b", symbol="MCL", quantity=2),
+        _ex(perm_id=111, exec_id="ok", symbol="MGC", quantity=1),
+    ]
+    out = _aggregate_fills_by_perm_id(fills)
+    assert len(out) == 3
+    # Distinct exec_ids preserved.
+    assert {e["exec_id"] for e in out} == {"orphan-a", "orphan-b", "ok"}
+
+
+def test_aggregate_fills_reconciler_integration_uses_vwap(audit):
+    """Reconciler receives the AGGREGATED fill, so the audit row reflects
+    VWAP + summed commission rather than just the first partial's data.
+
+    This is the bug-injection test for trade-safety-reviewer W1: before
+    aggregation, the audit row's fill_price/commission/realized_pnl
+    were the first partial's. After aggregation, they're the totals.
+    """
+    # Pre-existing pending audit row.
+    audit.log_execution(
+        run_date="2026-06-01", symbol="MCL",
+        event_type="adjustment", action="SELL", quantity=4,
+        fill_price=0.0, commission=0.0, status="PreSubmitted",
+        perm_id=1234567,
+    )
+    # Simulate the per-Fill output from reqExecutions: 3 partials.
+    raw_fills = [
+        {
+            "perm_id": 1234567, "exec_id": "exec-A", "symbol": "MCL",
+            "action": "SELL", "quantity": 1, "fill_price": 92.37,
+            "commission": 0.77, "realized_pnl": 447.46,
+            "time_iso": "2026-06-01T20:55:23.574+00:00",
+        },
+        {
+            "perm_id": 1234567, "exec_id": "exec-B", "symbol": "MCL",
+            "action": "SELL", "quantity": 2, "fill_price": 92.33,
+            "commission": 1.54, "realized_pnl": 886.92,
+            "time_iso": "2026-06-01T20:55:23.580+00:00",
+        },
+        {
+            "perm_id": 1234567, "exec_id": "exec-C", "symbol": "MCL",
+            "action": "SELL", "quantity": 1, "fill_price": 92.33,
+            "commission": 0.77, "realized_pnl": 443.46,
+            "time_iso": "2026-06-01T20:55:23.583+00:00",
+        },
+    ]
+    aggregated = _aggregate_fills_by_perm_id(raw_fills)
+    audit.reconcile_late_fills(aggregated, "2026-06-02")
+
+    row = audit._conn.execute(
+        "SELECT status, fill_price, commission, realized_pnl "
+        "FROM executions WHERE perm_id=?",
+        (1234567,),
+    ).fetchone()
+    assert row[0] == "Filled"
+    expected_vwap = (1*92.37 + 2*92.33 + 1*92.33) / 4
+    assert row[1] == pytest.approx(expected_vwap)
+    assert row[2] == pytest.approx(0.77 + 1.54 + 0.77)
+    assert row[3] == pytest.approx(447.46 + 886.92 + 443.46)
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,68 @@ from futures_executor.config.loader import BrokerSettings
 logger = logging.getLogger(__name__)
 
 
+def _aggregate_fills_by_perm_id(per_fill: list[dict]) -> list[dict]:
+    """Aggregate per-fill execution dicts into one entry per ``perm_id``.
+
+    Trade-safety-reviewer W1 for #228 A2 #4: ``reqExecutions`` returns one
+    Fill per partial execution. A single MARKET order on a micro futures
+    contract can have 2-3 partials in fast-moving sessions. Without
+    aggregation, the reconciler's first iteration UPDATEs the audit row
+    with the first partial's price/commission/realized_pnl, and subsequent
+    partials are silently dropped (their perm_id row is now ``Filled``).
+
+    Aggregation rules:
+      - ``quantity``: signed-by-action sum (BUY positive, SELL negative
+        within a perm_id are unusual but reduce together).
+      - ``fill_price``: VWAP across partials' shares × price.
+      - ``commission``: sum.
+      - ``realized_pnl``: sum (sentinel-filtered upstream).
+      - ``action``: first partial's action (all partials of one order
+        share the same side; defensive: assert same).
+      - ``symbol``: first partial's contract symbol (same reasoning).
+      - ``exec_id``: first partial's exec_id (kept as a representative;
+        downstream dedup uses perm_id, not exec_id).
+      - ``time_iso``: latest partial's timestamp (the moment the order
+        completed).
+      - ``perm_id``: shared key.
+
+    Entries with ``perm_id == 0`` or ``None`` are NOT aggregated — they're
+    treated as distinct orphan fills (no meaningful correlation key). The
+    reconciler handles those via the exec_id-only insertion path.
+    """
+    grouped: dict[int, list[dict]] = {}
+    orphans: list[dict] = []
+    for f in per_fill:
+        pid = f.get("perm_id")
+        if pid in (None, 0):
+            orphans.append(f)
+            continue
+        grouped.setdefault(int(pid), []).append(f)
+
+    out: list[dict] = []
+    for pid, partials in grouped.items():
+        if len(partials) == 1:
+            out.append(partials[0])
+            continue
+        total_shares = sum(p["quantity"] for p in partials)
+        notional = sum(p["quantity"] * p["fill_price"] for p in partials)
+        vwap = notional / total_shares if total_shares else 0.0
+        latest_time = max(p["time_iso"] for p in partials) if partials else ""
+        out.append({
+            "perm_id": pid,
+            "exec_id": partials[0]["exec_id"],
+            "symbol": partials[0]["symbol"],
+            "action": partials[0]["action"],
+            "quantity": total_shares,
+            "fill_price": vwap,
+            "commission": sum(p["commission"] for p in partials),
+            "realized_pnl": sum(p["realized_pnl"] for p in partials),
+            "time_iso": latest_time,
+        })
+    out.extend(orphans)
+    return out
+
+
 @dataclass
 class AccountInfo:
     equity: float = 0.0
@@ -352,8 +414,14 @@ class BrokerConnection:
         query before the first ever run.
 
         Returns a list of plain-dict shapes consumable by
-        ``AuditLog.reconcile_late_fills``. Per-Fill, not per-Execution:
-        a single order with multiple partial fills produces multiple entries.
+        ``AuditLog.reconcile_late_fills``. ONE ENTRY PER ``perm_id`` —
+        partial fills sharing the same perm_id are aggregated (VWAP price,
+        summed shares/commission/realized_pnl) by
+        ``_aggregate_fills_by_perm_id``. This mirrors how
+        ``get_fill_info`` aggregates ``trade.fills`` at submission time
+        and ensures multi-partial late fills land in the audit row with
+        complete economics, not just the first partial's. Trade-safety-
+        reviewer W1, #228 A2 #4.
 
         Resolution: ``Contract.symbol`` is the IBKR contract symbol (MES /
         MCL / MGC for micros). Callers typically need portfolio-symbol
@@ -384,7 +452,7 @@ class BrokerConnection:
         except Exception as e:
             logger.warning(f"fetch_executions_since: reqExecutions failed: {e}")
             return []
-        out: list[dict] = []
+        per_fill: list[dict] = []
         for f in fills:
             ex = f.execution
             cr = f.commissionReport
@@ -394,7 +462,7 @@ class BrokerConnection:
             pnl = cr.realizedPNL if cr is not None else 0.0
             if pnl is None or abs(pnl) >= 1e30:
                 pnl = 0.0
-            out.append({
+            per_fill.append({
                 "perm_id": int(ex.permId or 0),
                 "exec_id": ex.execId,
                 "symbol": f.contract.symbol,
@@ -405,7 +473,7 @@ class BrokerConnection:
                 "realized_pnl": float(pnl),
                 "time_iso": ex.time.isoformat() if ex.time is not None else "",
             })
-        return out
+        return _aggregate_fills_by_perm_id(per_fill)
 
     def cancel_order(self, trade: Trade, timeout: float = 10) -> bool:
         """Cancel an order. Returns True if cancelled/inactive."""
