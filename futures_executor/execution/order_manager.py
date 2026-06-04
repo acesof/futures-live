@@ -642,11 +642,23 @@ class OrderManager:
                     }
                 )
 
-        # Final verification
+        # Final verification. Symbols in pending_at_disconnect were
+        # intentionally left as working orders on an open venue (#228 A2);
+        # at this exact instant their actual_qty may not yet equal target_qty
+        # because the fill hasn't landed in the ~30s since Step 5 placed
+        # the order. Skipping them here (mirror of the mismatches-loop skip
+        # at line ~554) prevents a false-CRITICAL `reconcile_failed` event
+        # for the typical case where a working order simply hasn't filled
+        # within the cycle's wall-clock window. Late-fill audit reconciler
+        # (#228 A2 #4) is the eventual operator-facing signal for those
+        # orders' fills; this skip stops the alarm being misclassified as
+        # an emergency.
         if self.broker.is_connected:
             final = self.broker.get_positions_by_symbol()
             still_wrong = []
             for symbol, target in target_contracts.items():
+                if symbol in pending_at_disconnect:
+                    continue
                 actual = final.get(symbol)
                 actual_qty = int(actual.position) if actual else 0
                 if actual_qty != target:

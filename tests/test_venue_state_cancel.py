@@ -211,3 +211,96 @@ def test_reconcile_no_skip_arg_preserves_existing_behavior():
     # Call without the kwarg.
     records = om._reconcile(target_contracts, pairs, sizing)
     assert records == []
+
+
+def _resolved_mes() -> ResolvedContract:
+    """MES contract twin of ``_resolved()`` (which returns MGC). Lets tests
+    set up scenarios with TWO distinct contracts so per-symbol contract
+    resolution in ``_reconcile`` doesn't cross-route MES orders to MGC."""
+    return ResolvedContract(
+        symbol="MES", con_id=770561194, exchange="CME", currency="USD",
+        expiry=date(2026, 6, 18), expiry_str="20260618",
+        multiplier=5.0, local_symbol="MESM6", min_tick=0.25,
+        contract=_FakeContract(
+            conId=770561194, symbol="MES", exchange="CME",
+            localSymbol="MESM6",
+        ),
+    )
+
+
+def test_reconcile_final_verification_skips_pending_at_disconnect():
+    """[#228 A2 #3] Final verification must also honour pending_at_disconnect.
+
+    Pre-fix: the mismatches-loop skip (line ~554) excluded pending symbols
+    from corrective-order placement, BUT the final verification block (line
+    ~645) re-checked ALL ``target_contracts`` entries and flagged any
+    actual_qty ≠ target_qty as still_wrong → ``reconcile_failed`` CRITICAL.
+    For a working order whose fill hadn't landed in the ~30s before final
+    verification ran, this fired a false-CRITICAL.
+
+    Scenario: two symbols mismatched at the broker (MGC=0/target=1,
+    MES=0/target=22); MGC is in ``pending_at_disconnect``. The corrective
+    BUY 22 MES order is attempted (and fails inside the fake because
+    ``get_fill_info`` isn't stubbed — sufficient for this test). Final
+    verification then sees BOTH MES and MGC mismatched; with the fix it
+    skips MGC and only flags MES. Pre-fix would have flagged both.
+    """
+    broker = _FakeBroker(positions=[])  # broker has nothing
+    mgc_pair = ContractPair(
+        symbol="MGC", front=_resolved(), next=None,
+        days_to_expiry=65, roll_due=False, hard_deadline=False,
+        tradable_now=True, current_session_end=None,
+    )
+    mes_pair = ContractPair(
+        symbol="MES", front=_resolved_mes(), next=None,
+        days_to_expiry=14, roll_due=False, hard_deadline=False,
+        tradable_now=True, current_session_end=None,
+    )
+    pairs = {"MGC": mgc_pair, "MES": mes_pair}
+    sizing = {
+        "MGC": SizingResult(
+            symbol="MGC", target_signal=0.5, target_contracts=1,
+            notional_per_contract=45_000.0, multiplier=10.0, last_price=4500.0,
+        ),
+        "MES": SizingResult(
+            symbol="MES", target_signal=0.99, target_contracts=22,
+            notional_per_contract=37_000.0, multiplier=5.0, last_price=7400.0,
+        ),
+    }
+    target_contracts = {"MGC": 1, "MES": 22}
+
+    om = OrderManager(broker, _make_config())
+    records = om._reconcile(
+        target_contracts, pairs, sizing,
+        pending_at_disconnect={"MGC"},
+    )
+
+    # MGC should not appear in placed orders (mismatches-loop skip).
+    placed_symbols = [c.symbol for c, _, _ in broker.placed_market]
+    assert "MGC" not in placed_symbols, (
+        "MGC must not receive a corrective order while in "
+        f"pending_at_disconnect (placed: {placed_symbols})."
+    )
+
+    # MES should have received a corrective BUY (it's NOT pending).
+    assert any(
+        c.symbol == "MES" and act == "BUY" and qty == 22
+        for c, act, qty in broker.placed_market
+    ), f"MES corrective BUY should still be placed (placed: {broker.placed_market!r})."
+
+    # Exactly one reconcile_failed record from final verification, and its
+    # error message must NOT mention MGC (skipped) but MUST mention MES
+    # (genuine mismatch; the corrective attempt didn't fill in the fake).
+    failed = [r for r in records if r.get("type") == "reconcile_failed"]
+    assert len(failed) == 1, (
+        f"Expected 1 reconcile_failed record (MES mismatch), got {len(failed)}: {failed!r}"
+    )
+    err_msg = failed[0]["error"]
+    assert "MGC" not in err_msg, (
+        f"reconcile_failed error must not mention MGC (left-working-by-design), "
+        f"got: {err_msg!r}"
+    )
+    assert "MES" in err_msg, (
+        f"reconcile_failed error should still flag MES (genuine mismatch), "
+        f"got: {err_msg!r}"
+    )
