@@ -605,6 +605,7 @@ class OrderManager:
                     "quantity": qty,
                     "fill_price": fill.avg_fill_price,
                     "realized_pnl": fill.realized_pnl,
+                    "perm_id": fill.perm_id,
                     "commission": fill.commission,
                     "status": trade.orderStatus.status,
                     "target_contracts": target,
@@ -884,6 +885,7 @@ class OrderManager:
                 "quantity": current_qty,
                 "fill_price": fill.avg_fill_price,
                 "realized_pnl": fill.realized_pnl,
+                "perm_id": fill.perm_id,
                 "commission": fill.commission,
                 "status": trade.orderStatus.status,
             }
@@ -950,6 +952,7 @@ class OrderManager:
                     "quantity": close_qty,
                     "fill_price": fill.avg_fill_price,
                     "realized_pnl": fill.realized_pnl,
+                    "perm_id": fill.perm_id,
                     "commission": fill.commission,
                     "status": trade.orderStatus.status,
                 }
@@ -996,6 +999,7 @@ class OrderManager:
                     "quantity": open_qty,
                     "fill_price": fill.avg_fill_price,
                     "realized_pnl": fill.realized_pnl,
+                    "perm_id": fill.perm_id,
                     "commission": fill.commission,
                     "status": trade.orderStatus.status,
                 }
@@ -1111,6 +1115,7 @@ class OrderManager:
                 "quantity": qty,
                 "fill_price": fill.avg_fill_price,
                 "realized_pnl": fill.realized_pnl,
+                "perm_id": fill.perm_id,
                 "commission": fill.commission,
                 "status": trade.orderStatus.status,
             }, trade

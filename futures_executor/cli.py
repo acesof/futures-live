@@ -127,6 +127,31 @@ def cmd_run_once(args):
         notifier.notify_error("BROKER", str(e))
         return 1
 
+    # [#228 A2 #4] Late-fill audit reconciler. Updates audit rows for any
+    # orders that filled after the previous cycle's disconnect (typical
+    # case: a Step-5 order left working past Step 6 cancel by the
+    # venue-state gate in `848ef91`, then filled off-cycle on the open
+    # venue). Also inserts orphan rows for fills with no originating audit
+    # row (manual GUI orders, BAG-combo legs). Non-fatal: any failure logs a
+    # warning and the cycle continues — the operator's broker truth is
+    # still authoritative.
+    try:
+        since_iso = audit.get_last_run_timestamp()
+        if since_iso is not None:
+            ib_executions = broker.fetch_executions_since(since_iso)
+            if ib_executions:
+                result = audit.reconcile_late_fills(ib_executions, today)
+                if result["updated"] or result["inserted_orphan"]:
+                    logger.warning(
+                        f"Late-fill reconciler: "
+                        f"updated {result['updated']} audit row(s), "
+                        f"inserted {result['inserted_orphan']} orphan(s), "
+                        f"skipped {result['skipped']} already-Filled. "
+                        f"Window since: {since_iso}"
+                    )
+    except Exception as e:
+        logger.warning(f"Late-fill reconciler failed (non-fatal): {e}")
+
     try:
         # Build symbol mapping: execution symbol ↔ portfolio symbol
         # Strategies reference portfolio symbols (NQ, ES, ...),
@@ -371,6 +396,7 @@ def cmd_run_once(args):
                 realized_pnl=rec.get("realized_pnl"),
                 status=status,
                 error=rec.get("error"),
+                perm_id=rec.get("perm_id"),
             )
 
         # Update state — RELOAD from disk before saving. order_manager.
@@ -564,6 +590,7 @@ def cmd_flatten(args):
                 commission=fill.commission,
                 realized_pnl=fill.realized_pnl,
                 status=trade.orderStatus.status,
+                perm_id=fill.perm_id,
             )
             print(
                 f"  {pos.symbol}: {action} {qty} @ {fill.avg_fill_price:.2f} "
@@ -712,6 +739,7 @@ def cmd_manual_roll(args):
             commission=fill.commission,
             realized_pnl=fill.realized_pnl,
             status=trade.orderStatus.status,
+            perm_id=fill.perm_id,
         )
         notifier.notify_roll(
             args.symbol,

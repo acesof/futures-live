@@ -69,6 +69,11 @@ class FillInfo:
     # value is already in account currency, no conversion needed. Sign
     # convention: positive = profit on close, negative = loss.
     realized_pnl: float = 0.0
+    # IBKR-wide permanent order id, assigned at submission ack. Used by the
+    # late-fill audit reconciler (#228 A2 #4) to correlate later
+    # ``reqExecutions`` results back to the originating audit row. Zero for
+    # legacy / fake-broker callers that don't surface it.
+    perm_id: int = 0
 
 
 class BrokerConnection:
@@ -334,7 +339,73 @@ class BrokerConnection:
             avg_fill_price=avg_price,
             commission=commission,
             realized_pnl=realized_pnl,
+            perm_id=int(getattr(trade.order, "permId", 0) or 0),
         )
+
+    def fetch_executions_since(self, since_iso: str | None) -> list[dict]:
+        """Fetch IBKR Executions since ``since_iso`` for #228 A2 #4 reconciler.
+
+        ``since_iso`` is an ISO-8601 UTC timestamp (e.g.
+        ``2026-06-03T20:55:00``). Converts to IBKR's ``ExecutionFilter.time``
+        format (``yyyymmdd HH:MM:SS``). When ``None`` (no prior run on
+        record), returns an empty list — there's no meaningful window to
+        query before the first ever run.
+
+        Returns a list of plain-dict shapes consumable by
+        ``AuditLog.reconcile_late_fills``. Per-Fill, not per-Execution:
+        a single order with multiple partial fills produces multiple entries.
+
+        Resolution: ``Contract.symbol`` is the IBKR contract symbol (MES /
+        MCL / MGC for micros). Callers typically need portfolio-symbol
+        (ES / CL / GC) — the reconciler is symbol-agnostic for matching
+        (uses perm_id), but orphan rows pick up the IBKR contract symbol.
+        """
+        if since_iso is None:
+            return []
+        from ib_insync import ExecutionFilter
+        try:
+            # ISO 2026-06-03T20:55:00 → IBKR's "20260603 20:55:00 UTC". The
+            # explicit UTC suffix prevents IBKR from interpreting the string
+            # in the TWS session time-zone (default behaviour when no suffix
+            # is present). Trade-safety-reviewer W2, #228 A2 #4.
+            dt = since_iso.replace("T", " ").split(".")[0].split("+")[0]
+            ymd, hms = dt.split(" ")
+            ymd_compact = ymd.replace("-", "")
+            ib_time = f"{ymd_compact} {hms} UTC"
+        except Exception as e:
+            logger.warning(
+                f"fetch_executions_since: malformed since_iso={since_iso!r}: {e}; "
+                "skipping reconciler this run."
+            )
+            return []
+        try:
+            ex_filter = ExecutionFilter(time=ib_time)
+            fills = self.ib.reqExecutions(ex_filter)
+        except Exception as e:
+            logger.warning(f"fetch_executions_since: reqExecutions failed: {e}")
+            return []
+        out: list[dict] = []
+        for f in fills:
+            ex = f.execution
+            cr = f.commissionReport
+            # CommissionReport.realizedPNL uses sys.float_info.max as a
+            # "not applicable" sentinel on opening fills — mirror the filter
+            # in get_fill_info.
+            pnl = cr.realizedPNL if cr is not None else 0.0
+            if pnl is None or abs(pnl) >= 1e30:
+                pnl = 0.0
+            out.append({
+                "perm_id": int(ex.permId or 0),
+                "exec_id": ex.execId,
+                "symbol": f.contract.symbol,
+                "action": "BUY" if ex.side == "BOT" else "SELL",
+                "quantity": int(ex.shares),
+                "fill_price": float(ex.price),
+                "commission": float(cr.commission) if cr is not None else 0.0,
+                "realized_pnl": float(pnl),
+                "time_iso": ex.time.isoformat() if ex.time is not None else "",
+            })
+        return out
 
     def cancel_order(self, trade: Trade, timeout: float = 10) -> bool:
         """Cancel an order. Returns True if cancelled/inactive."""
