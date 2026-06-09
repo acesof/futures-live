@@ -120,7 +120,10 @@ class _FakeBroker:
         })
         return _FakeTrade(orderStatus=_FakeOrderStatus(status=self._spread_status))
 
-    def get_fill_info(self, _trade) -> FillInfo:
+    def get_fill_info(self, _trade, timeout: float = 30.0) -> FillInfo:
+        # `timeout` kwarg accepted for forward-compat with real BrokerConnection
+        # signature; ignored by the fake (no real I/O wait). 2026-06-09 bumped
+        # spread-roll timeout to 90s in `_execute_roll`.
         return FillInfo(
             order_id=0, symbol="MGC",
             action="SELL" if self._spread_status == "Filled" else "?",

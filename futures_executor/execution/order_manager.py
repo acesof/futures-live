@@ -876,7 +876,16 @@ class OrderManager:
                 quantity=current_qty,
             )
 
-            fill = self.broker.get_fill_info(trade)
+            # BAG calendar-spread orders go to CME's spread book, which is
+            # materially thinner than the outright micro books where MARKET
+            # orders fill in ~0.4s. 30s (the outright default) often isn't
+            # enough — on 2026-06-08, the MES 20→20 roll didn't fill in 30s
+            # and was left as a pending_at_disconnect order; broker truth
+            # confirmed it filled cleanly within ~34 min (post-cycle). With
+            # 90s here, the in-cycle window catches the typical spread-book
+            # latency without losing the safety net (A2 #2 venue-state cancel
+            # + A2 #4 late-fill reconciler still cover any beyond-90s tails).
+            fill = self.broker.get_fill_info(trade, timeout=90.0)
             record = {
                 "type": "roll",
                 "symbol": symbol,
