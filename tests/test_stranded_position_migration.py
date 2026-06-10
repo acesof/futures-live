@@ -308,6 +308,85 @@ def test_combo_rejected_adds_to_skip_no_state_write(tmp_path, monkeypatch):
     assert "MGC" not in state.get("active_contracts", {})
 
 
+def test_submitted_left_working_writes_state_and_skips(tmp_path, monkeypatch):
+    """[#228 cascade fix 2026-06-10] A migration_roll whose status is
+    Submitted/PreSubmitted/PendingSubmit (BAG combo left working on
+    open venue by A2 #2) must STILL update state.json optimistically.
+    Without this, the off-cycle fill never surfaces in state.json and
+    next cycle's resolver picks the OLD contract as front → triggers
+    a wrong-direction migration.
+
+    Symbol stays in ``skip`` (position is in flux this cycle), but
+    state.json now points at the migration target.
+    """
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(
+        positions=[_stranded_pos(+1)],
+        spread_status="Submitted",
+    )
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.migrate_stranded_positions(pairs, broker.get_positions())
+
+    assert len(records) == 1
+    assert records[0]["type"] == "migration_roll"
+    assert records[0]["status"] == "Submitted"
+    # Position is in flux → still excluded from this cycle's sizing.
+    assert "MGC" in skip
+
+    # State.json updated optimistically to the migration target.
+    from futures_executor.state import load_executor_state
+    state = load_executor_state()
+    # _pair_post_advance returns the post-buffer-advance pair where
+    # pair.front is the new contract; tests asserting Filled use the
+    # same expiry_str. We mirror that here.
+    expected_to_month = pairs["MGC"].front.expiry_str
+    assert state.get("active_contracts", {}).get("MGC") == expected_to_month, (
+        f"state.json should be updated to {expected_to_month} "
+        f"for Submitted (left-working) migration_roll, got "
+        f"{state.get('active_contracts')}"
+    )
+
+
+def test_empty_sp_exchange_falls_back_to_pair_front(tmp_path, monkeypatch):
+    """[#228 cascade fix 2026-06-10] ``sp.exchange`` from BrokerPosition is
+    sometimes empty (IBKR API quirk on futures). The synthetic stranded
+    ResolvedContract must use a non-empty exchange — fallback chain:
+    ``qualified[0].exchange`` → ``sp.exchange`` → ``pair.front.exchange``.
+
+    On 2026-06-09 cron, all three were involved in producing the BAG legs'
+    empty ``exchange`` field, triggering ``Error 321: Missing order
+    exchange`` on IBKR. This regression confirms the fallback works.
+    """
+    monkeypatch.chdir(tmp_path)
+    # Build a stranded position with empty exchange (the broker-side bug).
+    sp = BrokerPosition(
+        symbol="MGC", con_id=12345, contract_month="20260626",
+        local_symbol="MGCM6", exchange="",  # ← empty, the bug shape
+        position=1.0, avg_cost=4500.0, multiplier=10.0,
+        unrealized_pnl=0.0, realized_pnl=0.0, market_price=4500.0,
+    )
+    broker = _FakeBroker(positions=[sp], spread_status="Filled")
+    pairs = {"MGC": _pair_post_advance()}  # pair.front.exchange = "COMEX"
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.migrate_stranded_positions(pairs, broker.get_positions())
+
+    assert len(records) == 1
+    assert records[0]["type"] == "migration_roll"
+    # Spread order constructed and returned Filled — confirms the
+    # exchange fallback chain produced a non-empty value. Pre-fix,
+    # ``stranded_resolved.exchange = sp.exchange = ''`` would have
+    # propagated into place_spread_order's BAG construction.
+    assert records[0]["status"] == "Filled"
+    # State.json reflects the migration.
+    from futures_executor.state import load_executor_state
+    assert load_executor_state().get("active_contracts", {}).get("MGC") == (
+        pairs["MGC"].front.expiry_str
+    )
+
+
 def test_qualify_fails_blocked_no_spread_order(tmp_path, monkeypatch):
     """``qualifyContracts`` returns empty for the stranded ``con_id`` →
     record ``migration_blocked``, symbol in ``skip``, NO spread order

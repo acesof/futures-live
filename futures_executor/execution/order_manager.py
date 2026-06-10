@@ -413,18 +413,46 @@ class OrderManager:
                         records.append(_enrich(roll_record))
                     if roll_trade and not roll_trade.isDone():
                         pending_trades.append((symbol, roll_trade))
-                    # If roll didn't fill, skip adjustment for this symbol
-                    if roll_trade and roll_trade.orderStatus.status != "Filled":
+
+                    # State.json update policy (cascade fix 2026-06-10
+                    # after the 06-08/09 incident): write the new
+                    # contract on Filled OR Submitted/Working
+                    # (left-working by A2 #2 venue-state cancel). Without
+                    # the Submitted branch, an off-cycle fill never gets
+                    # surfaced in state.json — next cycle's resolver
+                    # picks the OLD contract as front, the strand-
+                    # migration path interprets broker truth (already on
+                    # the new contract) as "stranded", and tries to
+                    # un-roll the position. Only skip state update on
+                    # terminal-failure states (Cancelled / Inactive →
+                    # IBKR rejected the order; broker truth unchanged).
+                    roll_status = (
+                        roll_trade.orderStatus.status if roll_trade else None
+                    )
+                    if roll_status in (
+                        "Filled", "Submitted", "PreSubmitted", "PendingSubmit",
+                    ):
+                        state = load_executor_state()
+                        _save = set_active_contract(
+                            state, symbol, pair.next.expiry_str,
+                        )
+                        save_executor_state(_save)
+                        rolled = True
+                    elif roll_status in ("Cancelled", "Inactive"):
+                        logger.error(
+                            f"{symbol}: roll {roll_status} — state.json "
+                            "NOT updated; next cycle will retry."
+                        )
+
+                    # Skip adjustment unless we KNOW position is on new
+                    # contract (i.e., Filled). For Submitted/working,
+                    # broker quantity is in flux — wait for next cycle.
+                    if roll_status != "Filled":
                         logger.warning(
-                            f"{symbol}: roll not filled "
-                            f"(status={roll_trade.orderStatus.status}), "
-                            f"skipping adjustment"
+                            f"{symbol}: roll status={roll_status}, "
+                            "skipping adjustment this cycle"
                         )
                         continue
-                    state = load_executor_state()
-                    _save = set_active_contract(state, symbol, pair.next.expiry_str)
-                    save_executor_state(_save)
-                    rolled = True
 
             # After successful roll, adjustments must target the new contract
             if rolled:
@@ -777,10 +805,22 @@ class OrderManager:
                     skip.add(symbol)
                     continue
 
+                # Defense-in-depth for 2026-06-09 Error 321 ("Missing
+                # order exchange") on the BAG: ``sp.exchange`` (from
+                # BrokerPosition) is sometimes empty for futures positions
+                # — IBKR populates it on ``qualifyContracts``. Prefer the
+                # qualified contract's exchange; fall back to broker
+                # position's exchange; then to ``pair.front.exchange`` (the
+                # same-root contract guaranteed-populated by resolver).
+                stranded_exchange = (
+                    getattr(qualified[0], "exchange", "")
+                    or sp.exchange
+                    or pair.front.exchange
+                )
                 stranded_resolved = ResolvedContract(
                     symbol=sp.symbol,
                     con_id=sp.con_id,
-                    exchange=sp.exchange,
+                    exchange=stranded_exchange,
                     currency=pair.front.currency,
                     expiry=stranded_exp,
                     expiry_str=sp.contract_month,
@@ -831,17 +871,29 @@ class OrderManager:
                 record["type"] = "migration_roll"
                 records.append(record)
 
-                if record.get("status") == "Filled":
+                mig_status = record.get("status")
+                # Same state.json policy as the scheduled-roll branch
+                # above: update on Filled OR Submitted/working
+                # (A2 #2 left-working path). Skip update on terminal-
+                # failure states.
+                if mig_status in (
+                    "Filled", "Submitted", "PreSubmitted", "PendingSubmit",
+                ):
                     state = load_executor_state()
                     state = set_active_contract(
                         state, symbol, pair.front.expiry_str,
                     )
                     save_executor_state(state)
+                    # Filled migrations are full successes; left-working
+                    # ones still need to skip this cycle's sizing
+                    # because position state is in flux.
+                    if mig_status != "Filled":
+                        skip.add(symbol)
                 else:
                     logger.error(
                         f"{symbol}: migration_roll did not fill "
-                        f"(status={record.get('status')}); excluding "
-                        "from subsequent sizing."
+                        f"(status={mig_status}); excluding from "
+                        "subsequent sizing."
                     )
                     skip.add(symbol)
 
