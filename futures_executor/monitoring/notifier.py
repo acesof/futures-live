@@ -179,6 +179,23 @@ class SignalNotifier:
                     )
         else:
             lines.append("No orders executed")
+
+        # Always-explicit stuck-order line (operator requirement
+        # 2026-06-11): silence is not evidence — state the scan result
+        # every run. Guard records only exist on problems, so their
+        # absence means the cycle-start scan came back clean.
+        oo_problems = [
+            r for r in records
+            if r.get("type") in ("open_order_skip", "open_order_scan_failed")
+        ]
+        if oo_problems:
+            lines.append(
+                f"⚠️ Working orders at cycle start: "
+                f"{len(oo_problems)} symbol(s) BLOCKED — "
+                "cancel stuck order(s) in TWS to resume"
+            )
+        else:
+            lines.append("Working orders at cycle start: none ✓")
         lines.append("")
 
         # Account

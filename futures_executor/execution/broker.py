@@ -475,16 +475,15 @@ class BrokerConnection:
             })
         return _aggregate_fills_by_perm_id(per_fill)
 
-    def get_working_orders_by_symbol(self) -> dict[str, list[str]]:
-        """Working (active) orders per symbol, INCLUDING orders placed in a
-        previous session. ``reqAllOpenOrders`` pulls every open order on the
-        account (all clientIds + manual TWS); orders from our own clientId
-        are rebound automatically on reconnect and surface in ``openTrades``.
+    def get_working_orders(self) -> list[dict]:
+        """All working (active) orders on the account, INCLUDING orders
+        placed in a previous session. ``reqAllOpenOrders`` pulls every open
+        order (all clientIds + manual TWS); orders from our own clientId are
+        rebound automatically on reconnect.
 
-        Used by the cycle-start open-order guard (cascade fix 2026-06-11):
-        an order left working by a prior run (A2 #2 venue-state path) means
-        that symbol's position is in flux — placing anything new risks a
-        double roll. Returns symbol -> human-readable descriptors.
+        Used by the cycle-start open-order guard and the off-session audit
+        reconciler (cascade fix 2026-06-11). Returns one dict per order:
+        ``{symbol, order_id, perm_id, sec_type, status, filled, remaining}``.
         """
         # Use the RETURN value (List[Trade]), not ib.openTrades():
         # the returned snapshot includes other-client + manual-TWS
@@ -494,17 +493,30 @@ class BrokerConnection:
         active_states = {
             "PendingSubmit", "ApiPending", "PreSubmitted", "Submitted",
         }
-        out: dict[str, list[str]] = {}
+        out: list[dict] = []
         for tr in all_open:
             if tr.orderStatus.status not in active_states:
                 continue
-            sym = tr.contract.symbol
-            out.setdefault(sym, []).append(
-                f"orderId={tr.order.orderId} permId={tr.order.permId} "
-                f"secType={tr.contract.secType} "
-                f"status={tr.orderStatus.status} "
-                f"filled={tr.orderStatus.filled} "
-                f"remaining={tr.orderStatus.remaining}"
+            out.append({
+                "symbol": tr.contract.symbol,
+                "order_id": tr.order.orderId,
+                "perm_id": tr.order.permId,
+                "sec_type": tr.contract.secType,
+                "status": tr.orderStatus.status,
+                "filled": tr.orderStatus.filled,
+                "remaining": tr.orderStatus.remaining,
+            })
+        return out
+
+    def get_working_orders_by_symbol(self) -> dict[str, list[str]]:
+        """Working orders grouped by symbol as human-readable descriptors.
+        See ``get_working_orders`` for semantics."""
+        out: dict[str, list[str]] = {}
+        for w in self.get_working_orders():
+            out.setdefault(w["symbol"], []).append(
+                f"orderId={w['order_id']} permId={w['perm_id']} "
+                f"secType={w['sec_type']} status={w['status']} "
+                f"filled={w['filled']} remaining={w['remaining']}"
             )
         return out
 

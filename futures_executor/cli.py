@@ -152,6 +152,41 @@ def cmd_run_once(args):
     except Exception as e:
         logger.warning(f"Late-fill reconciler failed (non-fatal): {e}")
 
+    # [cascade fix 2026-06-11] Off-session audit reconciler — the
+    # cross-session half of A2 #4 that reqExecutions cannot cover (it
+    # only sees the current trading day). Resolves audit rows stuck in
+    # an active status from a previous run using broker truth: still in
+    # the open-order set → leave (open-order guard handles trading);
+    # otherwise infer Filled/Cancelled from positions-by-contract-month
+    # (valid only for last run's rolls — runs BEFORE any new orders).
+    # Non-fatal: failure logs and the cycle continues.
+    try:
+        working_perm_ids = {
+            w["perm_id"] for w in broker.get_working_orders() if w["perm_id"]
+        }
+        positions_by_month: dict[str, dict[str, float]] = {}
+        for p in broker.get_positions():
+            if p.position and p.contract_month:
+                sym_months = positions_by_month.setdefault(p.symbol, {})
+                sym_months[p.contract_month] = (
+                    sym_months.get(p.contract_month, 0.0) + p.position
+                )
+        counts = audit.reconcile_off_session(
+            working_perm_ids=working_perm_ids,
+            positions_by_month=positions_by_month,
+            today=today,
+            last_run_date=state.get("last_run_date"),
+        )
+        if any(counts.values()):
+            logger.warning(
+                f"Off-session audit reconciler: "
+                f"{counts['filled']} filled, {counts['cancelled']} cancelled, "
+                f"{counts['unknown']} unknown, "
+                f"{counts['still_working']} still working."
+            )
+    except Exception as e:
+        logger.warning(f"Off-session audit reconciler failed (non-fatal): {e}")
+
     try:
         # Build symbol mapping: execution symbol ↔ portfolio symbol
         # Strategies reference portfolio symbols (NQ, ES, ...),
@@ -391,6 +426,16 @@ def cmd_run_once(args):
 
             total_commission += commission
 
+            # Persist roll months so the off-session reconciler can
+            # infer Filled/Cancelled from positions-by-contract-month
+            # if this order is left working past disconnect.
+            rec_details = None
+            if rec.get("from_month") and rec.get("to_month"):
+                rec_details = {
+                    "from_month": rec["from_month"],
+                    "to_month": rec["to_month"],
+                }
+
             audit.log_execution(
                 run_date=today,
                 symbol=rec.get("symbol", ""),
@@ -406,6 +451,7 @@ def cmd_run_once(args):
                 realized_pnl=rec.get("realized_pnl"),
                 status=status,
                 error=rec.get("error"),
+                details=rec_details,
                 perm_id=rec.get("perm_id"),
             )
 

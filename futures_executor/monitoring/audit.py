@@ -235,6 +235,102 @@ class AuditLog:
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
+    def reconcile_off_session(
+        self,
+        working_perm_ids: set[int],
+        positions_by_month: dict[str, dict[str, float]],
+        today: str,
+        last_run_date: str | None,
+    ) -> dict:
+        """Resolve audit rows stuck in an active status from a PREVIOUS run.
+
+        Closes the cross-session half of #228 A2 #4: ``reqExecutions``
+        cannot see fills from a prior trading day, so an order left
+        working at disconnect that filled off-cycle leaves its audit row
+        at 'Submitted' forever. This runs at cycle start, BEFORE any new
+        orders, and resolves those rows from broker truth:
+
+        - perm_id still in the working-order set → order genuinely still
+          working; leave the row (the open-order guard handles trading).
+        - otherwise the order terminated off-session. For roll /
+          migration_roll rows from the IMMEDIATELY PRECEDING run whose
+          details carry from_month/to_month, infer the outcome from
+          current positions-by-contract-month (no orders have been
+          placed yet this cycle, so positions still reflect that order):
+          position on to_month and none on from_month → FilledOffSession;
+          the reverse → CancelledOffSession. Anything older or without
+          month info → TerminalUnknown (honest: outcome not verifiable).
+
+        Month inference is restricted to ``last_run_date`` rows because
+        intervening cycles' trades invalidate position inference for
+        older rows.
+
+        Returns counts: ``{filled, cancelled, unknown, still_working}``.
+        """
+        active = ("Submitted", "PreSubmitted", "PendingSubmit", "ApiPending")
+        rows = self._conn.execute(
+            f"""SELECT id, run_date, symbol, event_type, perm_id, details
+            FROM executions
+            WHERE status IN ({','.join('?' * len(active))})
+            AND run_date < ?""",
+            (*active, today),
+        ).fetchall()
+
+        counts = {"filled": 0, "cancelled": 0, "unknown": 0, "still_working": 0}
+        stamp = f"off-session reconcile {today}"
+        for rid, run_date, symbol, event_type, perm_id, details_json in rows:
+            if perm_id and perm_id in working_perm_ids:
+                counts["still_working"] += 1
+                continue
+
+            new_status = "TerminalUnknown"
+            note = (
+                f"{stamp}: not in open orders → terminated off-session; "
+                "outcome not verifiable from positions"
+            )
+            try:
+                details = json.loads(details_json) if details_json else {}
+            except (ValueError, TypeError):
+                details = {}
+            from_m = details.get("from_month")
+            to_m = details.get("to_month")
+            if (
+                event_type in ("roll", "migration_roll")
+                and from_m and to_m
+                and run_date == last_run_date
+            ):
+                by_month = positions_by_month.get(symbol, {})
+                on_to = by_month.get(to_m, 0.0)
+                on_from = by_month.get(from_m, 0.0)
+                if on_to and not on_from:
+                    new_status = "FilledOffSession"
+                    note = (
+                        f"{stamp}: position now on {to_m}, none on "
+                        f"{from_m} → filled off-session"
+                    )
+                    counts["filled"] += 1
+                elif on_from and not on_to:
+                    new_status = "CancelledOffSession"
+                    note = (
+                        f"{stamp}: position still on {from_m}, none on "
+                        f"{to_m} → cancelled/expired off-session"
+                    )
+                    counts["cancelled"] += 1
+                else:
+                    counts["unknown"] += 1
+            else:
+                counts["unknown"] += 1
+
+            self._conn.execute(
+                """UPDATE executions
+                SET status = ?,
+                    error = COALESCE(error || '; ', '') || ?
+                WHERE id = ?""",
+                (new_status, note, rid),
+            )
+        self._conn.commit()
+        return counts
+
     def reconcile_late_fills(
         self,
         executions: list[dict],
