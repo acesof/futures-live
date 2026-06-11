@@ -142,6 +142,24 @@ class SignalNotifier:
                         f"  CONTRACT-ADVANCE {symbol}: {from_m} -> {to_m} "
                         "(delivery buffer; no migration needed)"
                     )
+                elif event_type == "contract_adoption":
+                    from_m = rec.get("from_month", "?")
+                    to_m = rec.get("to_month", "?")
+                    lines.append(
+                        f"  CONTRACT-ADOPTION {symbol}: {from_m} -> {to_m} "
+                        "(broker truth adopted; no order placed)"
+                    )
+                elif event_type in (
+                    "open_order_skip",
+                    "open_order_scan_failed",
+                    "migration_refused_backward",
+                    "contract_ambiguous",
+                ):
+                    error = rec.get("error", "unknown")
+                    lines.append(
+                        f"  {event_type.upper().replace('_', '-')} "
+                        f"{symbol}: {error}"
+                    )
                 elif event_type in ("reconcile_error", "reconcile_failed"):
                     error = rec.get("error", "unknown")
                     lines.append(f"  {event_type.upper()}: {error} -> {status}")

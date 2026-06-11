@@ -376,6 +376,16 @@ def cmd_run_once(args):
                     kind=("MIGRATION-ROLL" if event_type == "migration_roll"
                           else "ROLL"),
                 )
+            elif event_type == "contract_adoption":
+                # Broker-truth reconciliation adopted the held month into
+                # state.json (off-cycle fill / stale state self-healed).
+                # Info-level Signal — no order was placed.
+                notifier.notify_contract_advance(
+                    rec["symbol"],
+                    rec.get("from_month", ""),
+                    rec.get("to_month", ""),
+                    reason="broker_truth_adoption",
+                )
             elif event_type in ("adjustment", "close", "open", "reconcile"):
                 n_orders += 1
 

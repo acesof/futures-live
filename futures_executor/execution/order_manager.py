@@ -30,6 +30,17 @@ from futures_executor.state import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_contract_month(month_str: str):
+    """Parse an IBKR contract month (``YYYYMMDD`` or ``YYYYMM``) to a date.
+
+    Used for expiry ORDERING decisions (adoption / direction guard) —
+    parse to ``date`` instead of comparing strings so a 6-char and an
+    8-char representation of the same month can never mis-order.
+    """
+    fmt = "%Y%m%d" if len(month_str) == 8 else "%Y%m"
+    return _dt.strptime(month_str, fmt).date()
+
+
 @dataclass
 class PositionDelta:
     """Difference between target and current positions for one instrument."""
@@ -256,6 +267,32 @@ class OrderManager:
         """
         all_positions = self.broker.get_positions()
 
+        # [cascade fix 2026-06-11] Guard 0 — working orders from a prior
+        # session. An order left working by A2 #2 (venue-state cancel skip)
+        # means that symbol's position is in flux; placing anything new
+        # risks a DOUBLE roll/adjustment. Fail-CLOSED: if the scan itself
+        # errors we cannot prove no order is working, so all symbols are
+        # excluded this cycle (miss a trade, never wrong trade).
+        guard_records, skip_symbols = self._skip_symbols_with_working_orders(
+            contract_pairs,
+        )
+        records: list[dict] = list(guard_records)
+
+        # [cascade fix 2026-06-11] Guard 1 — broker-truth contract
+        # reconciliation. Broker positions are GROUND TRUTH for which
+        # contract we are on; state.json is only a cache. If the broker
+        # holds a LATER month than the resolver's front, the roll already
+        # happened and state is stale (off-cycle fill, missed write,
+        # missing key) — adopt the held month into state.json and skip
+        # the symbol for one cycle. This replaces the 06-08→06-10 failure
+        # chain (stale state → resolver picks old front → strand detector
+        # "migrates" broker truth BACKWARD to match a broken model).
+        adopt_records, adopt_skip = self.reconcile_active_contracts(
+            contract_pairs, all_positions,
+        )
+        records.extend(adopt_records)
+        skip_symbols |= adopt_skip
+
         # [#228] Migrate any position held on a contract != pair.front
         # (the buffer-advance gap) BEFORE Step 1 sizing. The scheduled-
         # roll path can't see these because compute_position_diff is
@@ -263,10 +300,13 @@ class OrderManager:
         # NEW front. Without this, a position carried into the buffer
         # window strands silently. Failed migrations populate
         # skip_symbols so the rest of this method excludes them.
-        migration_records, skip_symbols = self.migrate_stranded_positions(
-            contract_pairs, all_positions,
+        # After Guard 1, only EARLIER-month strands reach this point
+        # (forward migration — the only legal direction).
+        migration_records, mig_skip = self.migrate_stranded_positions(
+            contract_pairs, all_positions, exclude=skip_symbols,
         )
-        records: list[dict] = list(migration_records)
+        records.extend(migration_records)
+        skip_symbols |= mig_skip
         if migration_records:
             # Re-fetch so the aggregation below sees post-migration truth.
             all_positions = self.broker.get_positions()
@@ -414,24 +454,21 @@ class OrderManager:
                     if roll_trade and not roll_trade.isDone():
                         pending_trades.append((symbol, roll_trade))
 
-                    # State.json update policy (cascade fix 2026-06-10
-                    # after the 06-08/09 incident): write the new
-                    # contract on Filled OR Submitted/Working
-                    # (left-working by A2 #2 venue-state cancel). Without
-                    # the Submitted branch, an off-cycle fill never gets
-                    # surfaced in state.json — next cycle's resolver
-                    # picks the OLD contract as front, the strand-
-                    # migration path interprets broker truth (already on
-                    # the new contract) as "stranded", and tries to
-                    # un-roll the position. Only skip state update on
-                    # terminal-failure states (Cancelled / Inactive →
-                    # IBKR rejected the order; broker truth unchanged).
+                    # State.json update policy (definitive fix 2026-06-11
+                    # after the 06-08→06-10 cascade): write ONLY on
+                    # Filled. The 06-10 optimistic write-on-Submitted
+                    # trusted the resolver's idea of the target month —
+                    # exactly the value that is wrong when state was
+                    # stale to begin with, which is how a wrong-direction
+                    # migration got locked into state.json. Left-working
+                    # orders are now handled by the NEXT cycle:
+                    # reconcile_active_contracts adopts the held month if
+                    # the order filled off-cycle, and the open-order
+                    # guard skips the symbol if it is still working.
                     roll_status = (
                         roll_trade.orderStatus.status if roll_trade else None
                     )
-                    if roll_status in (
-                        "Filled", "Submitted", "PreSubmitted", "PendingSubmit",
-                    ):
+                    if roll_status == "Filled":
                         state = load_executor_state()
                         _save = set_active_contract(
                             state, symbol, pair.next.expiry_str,
@@ -442,6 +479,13 @@ class OrderManager:
                         logger.error(
                             f"{symbol}: roll {roll_status} — state.json "
                             "NOT updated; next cycle will retry."
+                        )
+                    else:
+                        logger.warning(
+                            f"{symbol}: roll left working "
+                            f"(status={roll_status}) — state.json NOT "
+                            "updated; next cycle reconciles from broker "
+                            "truth (adopt if filled, skip if working)."
                         )
 
                     # Skip adjustment unless we KNOW position is on new
@@ -711,10 +755,157 @@ class OrderManager:
 
         return records
 
+    def _skip_symbols_with_working_orders(
+        self,
+        contract_pairs: dict[str, ContractPair],
+    ) -> tuple[list[dict], set[str]]:
+        """Cycle-start guard: exclude any symbol with a working order.
+
+        Orders left working by a previous run (A2 #2 leaves them on the
+        venue rather than cancel-at-close) mean the position is in flux —
+        a new roll or adjustment on top would double up. Such an order
+        still alive ~24h later is abnormal; report loudly and let the
+        operator decide, never trade around it.
+
+        Fail-CLOSED: if the open-order scan itself raises, we cannot
+        prove no order is working, so ALL symbols are excluded this
+        cycle (miss a trade, never wrong trade).
+        """
+        records: list[dict] = []
+        skip: set[str] = set()
+        try:
+            working = self.broker.get_working_orders_by_symbol()
+        except Exception as e:
+            msg = (
+                f"open-order scan failed ({e}); cannot prove no working "
+                "orders exist — skipping ALL symbols this cycle (fail-CLOSED)."
+            )
+            logger.critical(msg)
+            records.append({
+                "type": "open_order_scan_failed",
+                "symbol": "ALL",
+                "error": msg,
+                "status": "FAILED",
+            })
+            skip.update(contract_pairs.keys())
+            return records, skip
+
+        for symbol in contract_pairs:
+            if symbol not in working:
+                continue
+            msg = (
+                f"working order(s) from a previous session still active: "
+                f"{'; '.join(working[symbol])} — symbol skipped this cycle."
+            )
+            logger.critical(f"{symbol}: {msg}")
+            records.append({
+                "type": "open_order_skip",
+                "symbol": symbol,
+                "error": msg,
+                "status": "FAILED",
+            })
+            skip.add(symbol)
+        return records, skip
+
+    def reconcile_active_contracts(
+        self,
+        contract_pairs: dict[str, ContractPair],
+        all_positions: list[BrokerPosition],
+    ) -> tuple[list[dict], set[str]]:
+        """Broker-truth contract reconciliation (definitive fix 2026-06-11).
+
+        Broker positions are GROUND TRUTH for which contract a symbol is
+        on; ``state.json``'s ``active_contracts`` is only a cache (it goes
+        stale whenever an order is left working past the in-cycle window,
+        a key is missing, or an operator patch isn't applied). Per symbol
+        with a nonzero position:
+
+        - held month == ``pair.front`` → consistent, nothing to do.
+        - held month LATER than front → the roll already happened and the
+          resolver is working from stale state. ADOPT: write the held
+          month into ``active_contracts``, Signal, and skip the symbol
+          for one cycle (next run's resolver picks the adopted month and
+          everything is consistent). Never trade broker truth to match
+          a stale internal model — that is the 2026-06-10 incident.
+        - held month EARLIER than front → legitimate buffer-advance
+          strand; left for ``migrate_stranded_positions`` (forward
+          migration is the only legal direction).
+        - positions on 2+ months → mid-roll partial or unknown state;
+          refuse to trade the symbol, report loudly.
+        """
+        records: list[dict] = []
+        skip: set[str] = set()
+
+        for symbol, pair in contract_pairs.items():
+            held_months = {
+                p.contract_month
+                for p in all_positions
+                if p.symbol == symbol and p.position != 0 and p.contract_month
+            }
+            if not held_months:
+                continue
+            if len(held_months) > 1:
+                msg = (
+                    f"positions on multiple contract months "
+                    f"{sorted(held_months)} (mid-roll partial?) — "
+                    "ambiguous, refusing to trade this symbol; "
+                    "operator must inspect."
+                )
+                logger.critical(f"{symbol}: {msg}")
+                records.append({
+                    "type": "contract_ambiguous",
+                    "symbol": symbol,
+                    "error": msg,
+                    "status": "FAILED",
+                })
+                skip.add(symbol)
+                continue
+
+            held = next(iter(held_months))
+            if held == pair.front.expiry_str:
+                continue
+            try:
+                held_date = _parse_contract_month(held)
+            except ValueError:
+                msg = f"could not parse held contract_month={held!r}"
+                logger.critical(f"{symbol}: {msg}")
+                records.append({
+                    "type": "contract_ambiguous",
+                    "symbol": symbol,
+                    "error": msg,
+                    "status": "FAILED",
+                })
+                skip.add(symbol)
+                continue
+
+            if held_date > pair.front.expiry:
+                logger.warning(
+                    f"{symbol}: broker holds {held} but resolver front is "
+                    f"{pair.front.expiry_str} (earlier) — roll already "
+                    "happened, state was stale. Adopting broker truth into "
+                    "active_contracts; symbol skipped this cycle."
+                )
+                state = load_executor_state()
+                state = set_active_contract(state, symbol, held)
+                save_executor_state(state)
+                records.append({
+                    "type": "contract_adoption",
+                    "symbol": symbol,
+                    "from_month": pair.front.expiry_str,
+                    "to_month": held,
+                    "status": "ADOPTED",
+                })
+                skip.add(symbol)
+            # held earlier than front: buffer-advance strand → handled by
+            # migrate_stranded_positions (forward migration).
+
+        return records, skip
+
     def migrate_stranded_positions(
         self,
         contract_pairs: dict[str, ContractPair],
         all_positions: list[BrokerPosition],
+        exclude: set[str] | None = None,
     ) -> tuple[list[dict], set[str]]:
         """Auto-migrate positions stranded on a contract != pair.front.
 
@@ -739,8 +930,13 @@ class OrderManager:
         """
         records: list[dict] = []
         skip: set[str] = set()
+        exclude = exclude or set()
 
         for symbol, pair in contract_pairs.items():
+            if symbol in exclude:
+                # Already skipped by an upstream guard (working order /
+                # adoption / ambiguous) — never place a migration on top.
+                continue
             front_expiry = pair.front.expiry_str
             stranded = [
                 p for p in all_positions
@@ -783,19 +979,43 @@ class OrderManager:
                 # Parse stranded expiry_str into a ``date`` (same logic
                 # as ``contract_resolver._to_resolved`` parsing).
                 try:
-                    if len(sp.contract_month) == 8:
-                        stranded_exp = _dt.strptime(
-                            sp.contract_month, "%Y%m%d"
-                        ).date()
-                    else:
-                        stranded_exp = _dt.strptime(
-                            sp.contract_month, "%Y%m"
-                        ).date()
+                    stranded_exp = _parse_contract_month(sp.contract_month)
                 except ValueError:
                     msg = f"could not parse contract_month={sp.contract_month!r}"
                     logger.critical(f"{symbol}: {msg}")
                     records.append({
                         "type": "migration_blocked",
+                        "symbol": symbol,
+                        "from_month": sp.contract_month,
+                        "to_month": pair.front.expiry_str,
+                        "error": msg,
+                        "status": "FAILED",
+                    })
+                    skip.add(symbol)
+                    continue
+
+                # Direction guard (definitive fix 2026-06-11). A migration
+                # may ONLY roll forward in time (earlier-expiry strand →
+                # later-expiry front, the buffer-advance shape). Broker
+                # holding a LATER expiry than the resolver's front means
+                # state/front is stale — that is an adoption case, never
+                # a trade. On 2026-06-10 exactly this shape (MESU6→MESM6)
+                # was placed and filled, un-rolling a correct roll. After
+                # reconcile_active_contracts this branch is unreachable;
+                # it stays as the invariant of last resort.
+                if stranded_exp > pair.front.expiry:
+                    msg = (
+                        f"REFUSED backward migration {sp.local_symbol} "
+                        f"({sp.contract_month}) → {pair.front.local_symbol} "
+                        f"({pair.front.expiry_str}): broker holds a LATER "
+                        "expiry than the resolver's front. State/front is "
+                        "stale; rolling back in time is never correct. "
+                        "Should have been adopted by "
+                        "reconcile_active_contracts — investigate."
+                    )
+                    logger.critical(f"{symbol}: {msg}")
+                    records.append({
+                        "type": "migration_refused_backward",
                         "symbol": symbol,
                         "from_month": sp.contract_month,
                         "to_month": pair.front.expiry_str,
@@ -872,28 +1092,23 @@ class OrderManager:
                 records.append(record)
 
                 mig_status = record.get("status")
-                # Same state.json policy as the scheduled-roll branch
-                # above: update on Filled OR Submitted/working
-                # (A2 #2 left-working path). Skip update on terminal-
-                # failure states.
-                if mig_status in (
-                    "Filled", "Submitted", "PreSubmitted", "PendingSubmit",
-                ):
+                # Same state.json policy as the scheduled-roll branch:
+                # write ONLY on Filled (definitive fix 2026-06-11 — the
+                # optimistic write-on-Submitted is what locked the
+                # 06-10 wrong-direction migration into state.json).
+                # Left-working migrations resolve next cycle via
+                # broker-truth reconciliation + the open-order guard.
+                if mig_status == "Filled":
                     state = load_executor_state()
                     state = set_active_contract(
                         state, symbol, pair.front.expiry_str,
                     )
                     save_executor_state(state)
-                    # Filled migrations are full successes; left-working
-                    # ones still need to skip this cycle's sizing
-                    # because position state is in flux.
-                    if mig_status != "Filled":
-                        skip.add(symbol)
                 else:
                     logger.error(
                         f"{symbol}: migration_roll did not fill "
-                        f"(status={mig_status}); excluding from "
-                        "subsequent sizing."
+                        f"(status={mig_status}); state.json NOT updated; "
+                        "excluding from subsequent sizing."
                     )
                     skip.add(symbol)
 

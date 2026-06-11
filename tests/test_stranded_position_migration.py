@@ -93,6 +93,8 @@ class _FakeBroker:
         spread_status: str = "Filled",
         fill_price: float = 4500.0,
         commission: float = 0.5,
+        working_orders: dict[str, list[str]] | None = None,
+        working_orders_raises: bool = False,
     ):
         self._positions = positions
         self.ib = ib or _FakeIB()
@@ -100,9 +102,16 @@ class _FakeBroker:
         self._spread_status = spread_status
         self._fill_price = fill_price
         self._commission = commission
+        self._working_orders = working_orders or {}
+        self._working_orders_raises = working_orders_raises
 
     def get_positions(self) -> list[BrokerPosition]:
         return list(self._positions)
+
+    def get_working_orders_by_symbol(self) -> dict[str, list[str]]:
+        if self._working_orders_raises:
+            raise RuntimeError("simulated reqAllOpenOrders failure")
+        return dict(self._working_orders)
 
     def place_spread_order(
         self,
@@ -308,16 +317,19 @@ def test_combo_rejected_adds_to_skip_no_state_write(tmp_path, monkeypatch):
     assert "MGC" not in state.get("active_contracts", {})
 
 
-def test_submitted_left_working_writes_state_and_skips(tmp_path, monkeypatch):
-    """[#228 cascade fix 2026-06-10] A migration_roll whose status is
-    Submitted/PreSubmitted/PendingSubmit (BAG combo left working on
-    open venue by A2 #2) must STILL update state.json optimistically.
-    Without this, the off-cycle fill never surfaces in state.json and
-    next cycle's resolver picks the OLD contract as front → triggers
-    a wrong-direction migration.
+def test_submitted_left_working_does_not_write_state_and_skips(
+    tmp_path, monkeypatch,
+):
+    """[Definitive fix 2026-06-11 — INVERTS the 06-10 policy.] A
+    migration_roll left working (Submitted) must NOT write state.json.
+    The 06-10 optimistic write trusted ``pair.front`` — exactly the
+    value that is wrong when state was stale to begin with; it locked a
+    wrong-direction migration into state.json. Left-working orders are
+    now resolved by the NEXT cycle: ``reconcile_active_contracts``
+    adopts the held month if the order filled off-cycle, and the
+    open-order guard skips the symbol if it is still working.
 
-    Symbol stays in ``skip`` (position is in flux this cycle), but
-    state.json now points at the migration target.
+    Symbol stays in ``skip`` (position in flux); state.json untouched.
     """
     monkeypatch.chdir(tmp_path)
     broker = _FakeBroker(
@@ -332,21 +344,212 @@ def test_submitted_left_working_writes_state_and_skips(tmp_path, monkeypatch):
     assert len(records) == 1
     assert records[0]["type"] == "migration_roll"
     assert records[0]["status"] == "Submitted"
-    # Position is in flux → still excluded from this cycle's sizing.
+    # Position is in flux → excluded from this cycle's sizing.
     assert "MGC" in skip
 
-    # State.json updated optimistically to the migration target.
+    # State.json NOT updated — broker truth resolves it next cycle.
     from futures_executor.state import load_executor_state
     state = load_executor_state()
-    # _pair_post_advance returns the post-buffer-advance pair where
-    # pair.front is the new contract; tests asserting Filled use the
-    # same expiry_str. We mirror that here.
-    expected_to_month = pairs["MGC"].front.expiry_str
-    assert state.get("active_contracts", {}).get("MGC") == expected_to_month, (
-        f"state.json should be updated to {expected_to_month} "
-        f"for Submitted (left-working) migration_roll, got "
-        f"{state.get('active_contracts')}"
+    assert "MGC" not in state.get("active_contracts", {}), (
+        "Submitted (left-working) migration_roll must NOT write "
+        f"state.json, got {state.get('active_contracts')}"
     )
+
+
+def test_backward_migration_refused_no_order(tmp_path, monkeypatch):
+    """[Definitive fix 2026-06-11 — the 06-10 incident shape.] Broker
+    holds a LATER expiry (Sep) than the resolver's front (Aug) — the
+    roll already happened and state/front is stale. Migration must be
+    REFUSED before any order is placed: rolling back in time is never
+    correct. (2026-06-10: this exact shape filled 20 MES contracts
+    backward, MESU6 → MESM6.)"""
+    monkeypatch.chdir(tmp_path)
+    later_pos = BrokerPosition(
+        symbol="MGC", con_id=900000001, contract_month="20261029",
+        local_symbol="MGCV6", exchange="COMEX",
+        position=+1, avg_cost=4500.0, multiplier=10.0,
+    )
+    broker = _FakeBroker(positions=[later_pos])
+    pairs = {"MGC": _pair_post_advance()}  # front=MGCQ6 (Aug 2026)
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.migrate_stranded_positions(pairs, broker.get_positions())
+
+    assert len(records) == 1
+    assert records[0]["type"] == "migration_refused_backward"
+    assert records[0]["status"] == "FAILED"
+    assert "MGC" in skip
+    # The invariant of last resort: NO order reaches the broker.
+    assert broker.spread_orders == []
+    # State.json untouched.
+    from futures_executor.state import load_executor_state
+    assert "MGC" not in load_executor_state().get("active_contracts", {})
+
+
+def test_exclude_param_suppresses_migration(tmp_path, monkeypatch):
+    """A symbol already skipped by an upstream guard (working order /
+    adoption / ambiguous) must not get a migration placed on top."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[_stranded_pos(+1)])
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.migrate_stranded_positions(
+        pairs, broker.get_positions(), exclude={"MGC"},
+    )
+
+    assert records == []
+    assert skip == set()
+    assert broker.spread_orders == []
+
+
+# ---------------------------------------------------------------------------
+# reconcile_active_contracts — broker-truth adoption (definitive fix
+# 2026-06-11)
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_adopts_later_held_month(tmp_path, monkeypatch):
+    """Broker holds a LATER month (Oct) than resolver front (Aug) → the
+    roll already happened; adopt the held month into state.json, skip
+    the symbol one cycle, place NO order."""
+    monkeypatch.chdir(tmp_path)
+    later_pos = BrokerPosition(
+        symbol="MGC", con_id=900000001, contract_month="20261029",
+        local_symbol="MGCV6", exchange="COMEX",
+        position=+1, avg_cost=4500.0, multiplier=10.0,
+    )
+    broker = _FakeBroker(positions=[later_pos])
+    pairs = {"MGC": _pair_post_advance()}  # front=MGCQ6 (Aug 2026)
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.reconcile_active_contracts(pairs, broker.get_positions())
+
+    assert len(records) == 1
+    assert records[0]["type"] == "contract_adoption"
+    assert records[0]["status"] == "ADOPTED"
+    assert records[0]["from_month"] == "20260828"
+    assert records[0]["to_month"] == "20261029"
+    assert skip == {"MGC"}
+    assert broker.spread_orders == []
+
+    from futures_executor.state import load_executor_state
+    assert load_executor_state()["active_contracts"]["MGC"] == "20261029"
+
+
+def test_reconcile_consistent_position_is_noop(tmp_path, monkeypatch):
+    """Held month == pair.front → nothing to reconcile."""
+    monkeypatch.chdir(tmp_path)
+    pos_on_front = BrokerPosition(
+        symbol="MGC", con_id=732156883, contract_month="20260828",
+        local_symbol="MGCQ6", exchange="COMEX",
+        position=+1, avg_cost=4500.0, multiplier=10.0,
+    )
+    broker = _FakeBroker(positions=[pos_on_front])
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.reconcile_active_contracts(pairs, broker.get_positions())
+
+    assert records == []
+    assert skip == set()
+
+
+def test_reconcile_leaves_earlier_strand_for_migration(tmp_path, monkeypatch):
+    """Held month EARLIER than front (the legitimate buffer-advance
+    strand) is NOT adopted — it must flow to migrate_stranded_positions
+    for a forward migration."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[_stranded_pos(+1)])  # MGCM6 (June)
+    pairs = {"MGC": _pair_post_advance()}  # front=MGCQ6 (Aug)
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.reconcile_active_contracts(pairs, broker.get_positions())
+
+    assert records == []
+    assert skip == set()
+    from futures_executor.state import load_executor_state
+    assert "MGC" not in load_executor_state().get("active_contracts", {})
+
+
+def test_reconcile_multi_month_ambiguous_refuses(tmp_path, monkeypatch):
+    """Positions on 2+ months for one symbol (mid-roll partial) →
+    ambiguous; refuse to trade the symbol, FAILED record, no state
+    write."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[
+        _stranded_pos(+1),  # MGCM6
+        BrokerPosition(
+            symbol="MGC", con_id=732156883, contract_month="20260828",
+            local_symbol="MGCQ6", exchange="COMEX",
+            position=+2, avg_cost=4500.0, multiplier=10.0,
+        ),
+    ])
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om.reconcile_active_contracts(pairs, broker.get_positions())
+
+    assert len(records) == 1
+    assert records[0]["type"] == "contract_ambiguous"
+    assert records[0]["status"] == "FAILED"
+    assert skip == {"MGC"}
+    from futures_executor.state import load_executor_state
+    assert "MGC" not in load_executor_state().get("active_contracts", {})
+
+
+# ---------------------------------------------------------------------------
+# Open-order guard (definitive fix 2026-06-11)
+# ---------------------------------------------------------------------------
+
+
+def test_open_order_guard_skips_symbol(tmp_path, monkeypatch):
+    """A working order from a previous session → symbol skipped with a
+    loud FAILED record (routes to notify_error + exit 1)."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(
+        positions=[],
+        working_orders={"MGC": ["orderId=276 permId=123 secType=BAG "
+                                "status=Submitted filled=1.0 remaining=19.0"]},
+    )
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert len(records) == 1
+    assert records[0]["type"] == "open_order_skip"
+    assert records[0]["status"] == "FAILED"
+    assert "previous session" in records[0]["error"]
+    assert skip == {"MGC"}
+
+
+def test_open_order_guard_clean_scan_is_noop(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[])
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert records == []
+    assert skip == set()
+
+
+def test_open_order_guard_scan_failure_fail_closed(tmp_path, monkeypatch):
+    """If the open-order scan itself raises we cannot prove no order is
+    working → ALL symbols excluded (miss a trade, never wrong trade)."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[], working_orders_raises=True)
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert len(records) == 1
+    assert records[0]["type"] == "open_order_scan_failed"
+    assert records[0]["status"] == "FAILED"
+    assert skip == {"MGC"}
 
 
 def test_empty_sp_exchange_falls_back_to_pair_front(tmp_path, monkeypatch):

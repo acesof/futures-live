@@ -475,6 +475,39 @@ class BrokerConnection:
             })
         return _aggregate_fills_by_perm_id(per_fill)
 
+    def get_working_orders_by_symbol(self) -> dict[str, list[str]]:
+        """Working (active) orders per symbol, INCLUDING orders placed in a
+        previous session. ``reqAllOpenOrders`` pulls every open order on the
+        account (all clientIds + manual TWS); orders from our own clientId
+        are rebound automatically on reconnect and surface in ``openTrades``.
+
+        Used by the cycle-start open-order guard (cascade fix 2026-06-11):
+        an order left working by a prior run (A2 #2 venue-state path) means
+        that symbol's position is in flux — placing anything new risks a
+        double roll. Returns symbol -> human-readable descriptors.
+        """
+        # Use the RETURN value (List[Trade]), not ib.openTrades():
+        # the returned snapshot includes other-client + manual-TWS
+        # orders, which openTrades() does not keep in sync. Strictly
+        # wider net for the same guard.
+        all_open = self.ib.reqAllOpenOrders()
+        active_states = {
+            "PendingSubmit", "ApiPending", "PreSubmitted", "Submitted",
+        }
+        out: dict[str, list[str]] = {}
+        for tr in all_open:
+            if tr.orderStatus.status not in active_states:
+                continue
+            sym = tr.contract.symbol
+            out.setdefault(sym, []).append(
+                f"orderId={tr.order.orderId} permId={tr.order.permId} "
+                f"secType={tr.contract.secType} "
+                f"status={tr.orderStatus.status} "
+                f"filled={tr.orderStatus.filled} "
+                f"remaining={tr.orderStatus.remaining}"
+            )
+        return out
+
     def cancel_order(self, trade: Trade, timeout: float = 10) -> bool:
         """Cancel an order. Returns True if cancelled/inactive."""
         if trade.isDone():
