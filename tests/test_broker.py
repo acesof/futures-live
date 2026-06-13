@@ -267,6 +267,56 @@ def test_get_fill_info_all_negative_realized_pnl_sums_correctly(broker):
 
 
 # ---------------------------------------------------------------------------
+# fetch_executions_since — ingest-boundary secType filter (2026-06-13)
+# ---------------------------------------------------------------------------
+
+def _exec_fill(symbol: str, sec_type: str, perm_id: int, exec_id: str,
+               shares: float = 1.0, price: float = 100.0, side: str = "BOT",
+               commission: float = 0.5, realized_pnl: float = 0.0):
+    """Mimic an ib_insync Fill returned by reqExecutions (distinct shape
+    from the trade-fill helper: carries contract.secType + execution.permId)."""
+    import datetime
+    f = SimpleNamespace()
+    f.contract = SimpleNamespace(symbol=symbol, secType=sec_type)
+    f.execution = SimpleNamespace(
+        permId=perm_id, execId=exec_id, side=side, shares=shares, price=price,
+        time=datetime.datetime(2026, 6, 12, 20, 55, 0, tzinfo=datetime.timezone.utc),
+    )
+    f.commissionReport = SimpleNamespace(commission=commission, realizedPNL=realized_pnl)
+    return f
+
+
+def test_fetch_executions_since_drops_options_and_warrants(broker):
+    """Ingest boundary: reqExecutions returns every account execution incl.
+    options (FOP) and warrants (WAR) sharing a root symbol with our futures.
+    Only FUT/CONTFUT survive — mirrors get_positions. (2026-06-12 MES-option
+    pollution: a third-party MES FOP fill reported symbol='MES' and leaked
+    into audit.db orphans → monitor.db fills.)"""
+    broker.ib.reqExecutions.return_value = [
+        _exec_fill("MES", "FUT", perm_id=100, exec_id="a"),
+        _exec_fill("MES", "FOP", perm_id=101, exec_id="b"),       # option → dropped
+        _exec_fill("MGC", "WAR", perm_id=102, exec_id="c"),       # warrant → dropped
+        _exec_fill("MCL", "CONTFUT", perm_id=103, exec_id="d"),
+    ]
+    out = broker.fetch_executions_since("2026-06-12T20:55:00")
+
+    assert {o["perm_id"] for o in out} == {100, 103}
+    assert {o["symbol"] for o in out} == {"MES", "MCL"}
+
+
+def test_fetch_executions_since_keeps_pure_futures_unchanged(broker):
+    """All-FUT execution set passes through untouched (no regression to the
+    normal roll/adjustment late-fill path)."""
+    broker.ib.reqExecutions.return_value = [
+        _exec_fill("MES", "FUT", perm_id=200, exec_id="a", shares=2.0, price=7400.0),
+    ]
+    out = broker.fetch_executions_since("2026-06-12T20:55:00")
+    assert len(out) == 1
+    assert out[0]["perm_id"] == 200
+    assert out[0]["quantity"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Connection state
 # ---------------------------------------------------------------------------
 

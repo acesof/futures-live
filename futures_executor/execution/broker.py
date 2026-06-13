@@ -454,6 +454,26 @@ class BrokerConnection:
             return []
         per_fill: list[dict] = []
         for f in fills:
+            # Ingest boundary: keep ONLY outright futures executions, mirroring
+            # the secType filter in get_positions(). reqExecutions returns every
+            # execution on the account — including options (FOP) and warrants
+            # (WAR) that share an underlying root symbol with our futures (e.g.
+            # a third-party MES option reports symbol="MES"). audit.db.executions
+            # has no secType column, so this is the LAST point the information
+            # needed to filter exists — once an option fill is written as an
+            # orphan row, every downstream consumer (snapshot fills_today →
+            # monitor.db fills → dashboard) sees only symbol and can't tell it
+            # from a future. Drop non-futures here so broker.py never hands the
+            # rest of the system anything but futures. (2026-06-13; the
+            # 2026-06-12 MES-option pollution incident.)
+            sec_type = getattr(f.contract, "secType", "")
+            if sec_type not in ("FUT", "CONTFUT"):
+                logger.debug(
+                    f"fetch_executions_since: skipping non-futures execution "
+                    f"{f.contract.symbol} secType={sec_type} "
+                    f"permId={f.execution.permId}"
+                )
+                continue
             ex = f.execution
             cr = f.commissionReport
             # CommissionReport.realizedPNL uses sys.float_info.max as a
