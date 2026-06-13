@@ -93,7 +93,7 @@ class _FakeBroker:
         spread_status: str = "Filled",
         fill_price: float = 4500.0,
         commission: float = 0.5,
-        working_orders: dict[str, list[str]] | None = None,
+        working_orders: list[dict] | None = None,
         working_orders_raises: bool = False,
     ):
         self._positions = positions
@@ -102,16 +102,19 @@ class _FakeBroker:
         self._spread_status = spread_status
         self._fill_price = fill_price
         self._commission = commission
-        self._working_orders = working_orders or {}
+        # Structured working-order snapshot: list of dicts mirroring
+        # BrokerConnection.get_working_orders (symbol/order_id/perm_id/
+        # sec_type/status/filled/remaining).
+        self._working_orders = working_orders or []
         self._working_orders_raises = working_orders_raises
 
     def get_positions(self) -> list[BrokerPosition]:
         return list(self._positions)
 
-    def get_working_orders_by_symbol(self) -> dict[str, list[str]]:
+    def get_working_orders(self) -> list[dict]:
         if self._working_orders_raises:
             raise RuntimeError("simulated reqAllOpenOrders failure")
-        return dict(self._working_orders)
+        return list(self._working_orders)
 
     def place_spread_order(
         self,
@@ -499,19 +502,26 @@ def test_reconcile_multi_month_ambiguous_refuses(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Open-order guard (definitive fix 2026-06-11)
+# Open-order guard (definitive fix 2026-06-11; secType scoping 2026-06-13)
 # ---------------------------------------------------------------------------
 
 
-def test_open_order_guard_skips_symbol(tmp_path, monkeypatch):
-    """A working order from a previous session → symbol skipped with a
-    loud FAILED record (routes to notify_error + exit 1)."""
+def _wo(symbol, sec_type, order_id=276, perm_id=123,
+        status="Submitted", filled=0.0, remaining=1.0) -> dict:
+    """Build a structured working-order dict (mirrors
+    BrokerConnection.get_working_orders)."""
+    return {
+        "symbol": symbol, "order_id": order_id, "perm_id": perm_id,
+        "sec_type": sec_type, "status": status,
+        "filled": filled, "remaining": remaining,
+    }
+
+
+def test_open_order_guard_blocks_working_fut(tmp_path, monkeypatch):
+    """A working outright FUT order → symbol blocked (FAILED record →
+    notify_error + exit 1)."""
     monkeypatch.chdir(tmp_path)
-    broker = _FakeBroker(
-        positions=[],
-        working_orders={"MGC": ["orderId=276 permId=123 secType=BAG "
-                                "status=Submitted filled=1.0 remaining=19.0"]},
-    )
+    broker = _FakeBroker(positions=[], working_orders=[_wo("MGC", "FUT")])
     pairs = {"MGC": _pair_post_advance()}
     om = OrderManager(broker, _make_config())
 
@@ -522,6 +532,76 @@ def test_open_order_guard_skips_symbol(tmp_path, monkeypatch):
     assert records[0]["status"] == "FAILED"
     assert "previous session" in records[0]["error"]
     assert skip == {"MGC"}
+
+
+def test_open_order_guard_blocks_working_bag_roll(tmp_path, monkeypatch):
+    """A working BAG calendar-spread roll → symbol blocked. THIS is the
+    2026-06-10 cascade shape; the secType filter MUST include BAG or the
+    double-roll hole reopens."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(
+        positions=[],
+        working_orders=[_wo("MGC", "BAG", filled=1.0, remaining=19.0)],
+    )
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert len(records) == 1
+    assert records[0]["type"] == "open_order_skip"
+    assert skip == {"MGC"}
+
+
+def test_open_order_guard_ignores_working_option(tmp_path, monkeypatch):
+    """[2026-06-13 fix] A working FOP (futures option) on the same root
+    symbol does NOT block futures rebalancing — it can't move the
+    outright futures position. A legitimate third-party MES option order
+    must not freeze our MES future. (The 2026-06-12 incident.)"""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(
+        positions=[],
+        working_orders=[_wo("MGC", "FOP", order_id=822, perm_id=1750833134)],
+    )
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert records == []
+    assert skip == set()
+
+
+def test_open_order_guard_mixed_option_and_fut_blocks(tmp_path, monkeypatch):
+    """A FOP and a FUT on the same symbol → blocked (the FUT is
+    position-affecting; the FOP is ignored but doesn't rescue it)."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[], working_orders=[
+        _wo("MGC", "FOP", order_id=822, perm_id=1750833134),
+        _wo("MGC", "FUT", order_id=900, perm_id=999),
+    ])
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert skip == {"MGC"}
+    # Only the FUT descriptor appears in the block reason, not the FOP.
+    assert "permId=999" in records[0]["error"]
+    assert "permId=1750833134" not in records[0]["error"]
+
+
+def test_open_order_guard_ignores_order_on_untraded_symbol(tmp_path, monkeypatch):
+    """A working FUT on a symbol we don't trade this cycle is irrelevant."""
+    monkeypatch.chdir(tmp_path)
+    broker = _FakeBroker(positions=[], working_orders=[_wo("MNQ", "FUT")])
+    pairs = {"MGC": _pair_post_advance()}
+    om = OrderManager(broker, _make_config())
+
+    records, skip = om._skip_symbols_with_working_orders(pairs)
+
+    assert records == []
+    assert skip == set()
 
 
 def test_open_order_guard_clean_scan_is_noop(tmp_path, monkeypatch):

@@ -29,6 +29,19 @@ from futures_executor.state import (
 
 logger = logging.getLogger(__name__)
 
+# Instrument classes whose working orders can change our OUTRIGHT futures
+# position — the only ones the cycle-start open-order guard should block on.
+# `FUT` = outright micro-future adjustment; `BAG` = calendar-spread roll
+# combo (the 2026-06-10 cascade was a left-working BAG, so this MUST be
+# included — filtering to FUT alone would silently re-open the double-roll
+# hole). Options/warrants (`FOP`/`OPT`/`WAR`/...) share the underlying root
+# symbol but do NOT move the futures position (an option only becomes a
+# futures position via exercise/assignment, which surfaces as a POSITION and
+# is handled by reconcile_active_contracts — not as a working order here), so
+# a legitimate third-party MES option order must not block MES futures
+# trading. See 2026-06-12 incident.
+POSITION_AFFECTING_SECTYPES = frozenset({"FUT", "BAG"})
+
 
 def _parse_contract_month(month_str: str):
     """Parse an IBKR contract month (``YYYYMMDD`` or ``YYYYMM``) to a date.
@@ -759,13 +772,20 @@ class OrderManager:
         self,
         contract_pairs: dict[str, ContractPair],
     ) -> tuple[list[dict], set[str]]:
-        """Cycle-start guard: exclude any symbol with a working order.
+        """Cycle-start guard: exclude any symbol with a working order
+        that can change our OUTRIGHT futures position.
 
         Orders left working by a previous run (A2 #2 leaves them on the
         venue rather than cancel-at-close) mean the position is in flux —
         a new roll or adjustment on top would double up. Such an order
         still alive ~24h later is abnormal; report loudly and let the
         operator decide, never trade around it.
+
+        Only `FUT`/`BAG` working orders block (see
+        ``POSITION_AFFECTING_SECTYPES``). Options/warrants share the
+        underlying root symbol but don't move the futures position, so a
+        legitimate third-party MES option order is logged and IGNORED —
+        not a reason to freeze MES futures rebalancing (2026-06-12 fix).
 
         Fail-CLOSED: if the open-order scan itself raises, we cannot
         prove no order is working, so ALL symbols are excluded this
@@ -774,7 +794,7 @@ class OrderManager:
         records: list[dict] = []
         skip: set[str] = set()
         try:
-            working = self.broker.get_working_orders_by_symbol()
+            working = self.broker.get_working_orders()
         except Exception as e:
             msg = (
                 f"open-order scan failed ({e}); cannot prove no working "
@@ -790,12 +810,35 @@ class OrderManager:
             skip.update(contract_pairs.keys())
             return records, skip
 
+        # Group working orders by symbol, splitting position-affecting
+        # (FUT/BAG → block) from non-position-affecting (FOP/OPT/WAR/... →
+        # ignore but log, so a genuinely-stuck order of OURS is never
+        # masked by the filter).
+        blocking: dict[str, list[str]] = {}
+        for w in working:
+            sym = w["symbol"]
+            if sym not in contract_pairs:
+                continue
+            desc = (
+                f"orderId={w['order_id']} permId={w['perm_id']} "
+                f"secType={w['sec_type']} status={w['status']} "
+                f"filled={w['filled']} remaining={w['remaining']}"
+            )
+            if w["sec_type"] in POSITION_AFFECTING_SECTYPES:
+                blocking.setdefault(sym, []).append(desc)
+            else:
+                logger.info(
+                    f"{sym}: ignoring working non-futures order "
+                    f"(not position-affecting): {desc}"
+                )
+
         for symbol in contract_pairs:
-            if symbol not in working:
+            if symbol not in blocking:
                 continue
             msg = (
-                f"working order(s) from a previous session still active: "
-                f"{'; '.join(working[symbol])} — symbol skipped this cycle."
+                f"working futures order(s) from a previous session still "
+                f"active: {'; '.join(blocking[symbol])} — symbol skipped "
+                "this cycle."
             )
             logger.critical(f"{symbol}: {msg}")
             records.append({
